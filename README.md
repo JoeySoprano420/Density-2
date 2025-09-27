@@ -1,6 +1,6 @@
 # Density-2
 
-Here’s a clear **first-cut spec** for *Density 2* based on what you wrote. I’ve broken it into layers so you can see at a glance how the language is supposed to behave and how it’s different from v1.0:
+Here’s a clear **first-cut spec** for *Density 2* broken into layers so you can see at a glance how the language is supposed to behave and how it’s different from v1.0:
 
 ---
 
