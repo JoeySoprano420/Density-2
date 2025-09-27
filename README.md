@@ -46,6 +46,30 @@ Save as density2_compiler.py, run:
 
 python density2_compiler.py
 
+Test with a richer .den file
+Main() {
+    '''SayHello(name)
+        Print: ("Hello, " + name + "!");
+    ,,,
+
+    #asm
+        mov eax, 60
+        xor edi, edi
+        syscall
+    #endasm
+
+    Print: ("Hello, World!");
+}
+
+
+Run python density2_compiler.py again — the AST now includes CIAMBlock and InlineBlock nodes:
+
+AST:
+Program([Function(Main, body=[CIAMBlock('SayHello(name)\n        Print: ("Hello, " + name + "!");'), InlineBlock(lang='asm', content='mov eax, 60\n        xor edi, edi\n        syscall'), Print(Hello, World!)])])
+
+
+This is a real parser for Density 2 Hello World + CIAM + inline code with no placeholders or pass. From here you can walk the AST and generate NASM or C accordingly.
+
 
 That’s still valid Density 2 — the compiler will expand the `SayHello` CIAM at compile-time and splice the NASM directly into the generated assembly.
 
