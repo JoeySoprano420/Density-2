@@ -120,3 +120,46 @@ Code generator → real .asm file
 
 ## _____
 
+Run:
+
+python density2_compiler.py
+
+
+Now out.asm contains:
+
+section .data
+    str_0 db "Hello, World!", 10, 0
+    str_1 db "Density 2!", 10, 0
+section .text
+    global _start
+_start:
+    mov rax, 1          ; sys_write
+    mov rdi, 1          ; stdout
+    mov rsi, str_0    ; message
+    mov rdx, 14         ; length
+    syscall
+    mov rax, 1          ; sys_write
+    mov rdi, 1          ; stdout
+    mov rsi, str_1    ; message
+    mov rdx, 11         ; length
+    syscall
+    mov rax, 60         ; sys_exit
+    xor rdi, rdi        ; status 0
+    syscall
+
+
+Assemble and run:
+
+nasm -f elf64 out.asm -o out.o
+ld out.o -o out
+./out
+
+
+Output:
+
+Hello, World!
+Density 2!
+
+
+This gives you a real end-to-end pipeline: Density 2 .den file → AST → .asm → executable.
+
