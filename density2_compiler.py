@@ -164,20 +164,26 @@ class Parser:
 # -----------------------------
 if __name__ == '__main__':
     code = '''
-    // Density 2 Hello World Program
-
     Main() {
         Print: ("Hello, World!");
     }
     '''
     tokens = tokenize(code)
-    print("TOKENS:")
-    for t in tokens:
-        print(t)
     parser = Parser(tokens)
     ast = parser.parse()
-    print("\nAST:")
+    print("AST:")
     print(ast)
+
+    gen = CodeGenerator(ast)
+    asm = gen.generate()
+    print("\nGenerated NASM:\n")
+    print(asm)
+
+    # write to file
+    with open('out.asm', 'w') as f:
+        f.write(asm)
+    print("\nWritten to out.asm")
+
 
 class CIAMBlock(ASTNode):
     def __init__(self, content: str):
