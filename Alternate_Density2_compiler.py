@@ -882,14 +882,13 @@ class CodeGenerator:
             self.label_counter += 1
             return lbl
 
-        # Very restricted globals/locals
         globals_dict = {
             '__builtins__': {
                 'range': range,
                 'len': len,
                 'str': str,
                 'int': int,
-                'print': print,  # debug if needed
+                'print': print,
             },
             'emit': emit,
             'label': label,
@@ -918,14 +917,14 @@ class CodeGenerator:
             with open(c_path, 'w', encoding='utf-8') as f:
                 f.write(c_code)
 
-            cmd: List[str]
             if compiler == 'tcc':
-                # tcc can emit assembly with -S
                 cmd = [compiler, '-nostdlib', '-S', c_path, '-o', asm_path]
             elif compiler == 'clang':
-                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path,
+                       '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
             else:  # gcc
-                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path,
+                       '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
 
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -935,16 +934,12 @@ class CodeGenerator:
             with open(asm_path, 'r', encoding='utf-8', errors='ignore') as f:
                 raw = f.read()
 
-            # Attempt to translate AT&T/Intel output to NASM
             translated = self._translate_att_to_nasm(raw)
             if translated:
                 return translated
 
-            # Fallback to comments if translation failed
-            commented = []
-            commented.append('; [begin compiled C assembly]')
-            for line in raw.splitlines():
-                commented.append('; ' + line)
+            commented = ['; [begin compiled C assembly]']
+            commented += ['; ' + line for line in raw.splitlines()]
             commented.append('; [end compiled C assembly]')
             return commented
         except Exception as ex:
@@ -956,7 +951,6 @@ class CodeGenerator:
                 pass
 
     # --- AT&T -> NASM best-effort translation helpers ---
-
     def _translate_att_to_nasm(self, att_asm: str) -> List[str]:
         out: List[str] = []
         for line in att_asm.splitlines():
@@ -964,7 +958,6 @@ class CodeGenerator:
             if not s:
                 continue
 
-            # Ignore sectioning and many metadata directives
             if s.startswith('.'):
                 if s.startswith(('.globl', '.global', '.text', '.data', '.bss', '.rodata', '.section',
                                  '.type', '.size', '.file', '.ident', '.cfi', '.p2align', '.intel_syntax', '.att_syntax')):
@@ -972,12 +965,10 @@ class CodeGenerator:
                 out.append(f'; {s}')
                 continue
 
-            # Preserve labels
             if s.endswith(':'):
                 out.append(s)
                 continue
 
-            # Remove trailing comments
             s = s.split('\t#', 1)[0].split(' #', 1)[0].strip()
             if not s:
                 continue
@@ -985,12 +976,11 @@ class CodeGenerator:
             parts = s.split(None, 1)
             op = parts[0]
             rest = parts[1] if len(parts) > 1 else ''
-            op_n = re.sub(r'(q|l|w|b)$', '', op)  # drop size suffix
+            op_n = re.sub(r'(q|l|w|b)$', '', op)
 
             ops = [o.strip() for o in rest.split(',')] if rest else []
             ops = [self._att_operand_to_nasm(o) for o in ops]
 
-            # Reverse operand order for two-operand instructions
             if len(ops) == 2:
                 ops = [ops[1], ops[0]]
 
@@ -1003,13 +993,10 @@ class CodeGenerator:
 
     def _att_operand_to_nasm(self, o: str) -> str:
         o = o.strip()
-        # Immediate: $val -> val
         if o.startswith('$'):
             return o[1:]
-        # Registers: %rax -> rax
         o = re.sub(r'%([a-zA-Z][a-zA-Z0-9]*)', r'\1', o)
 
-        # RIP-relative or disp(base,index,scale)
         m = re.match(r'^\s*([\-+]?\d+)?\s*\(\s*([a-zA-Z0-9%]+)\s*(?:,\s*([a-zA-Z0-9%]+)\s*(?:,\s*(\d+))?)?\s*\)\s*$', o)
         if m:
             disp, base, index, scale = m.groups()
@@ -1025,7 +1012,6 @@ class CodeGenerator:
                 addr = f'{addr} {sign} {abs(int(disp))}' if addr else str(disp)
             return f'[{addr}]'
 
-        # Bare symbol or already simple
         return o
 
 
@@ -1120,6 +1106,10 @@ emit("mov rdi, 1")
 
     print("\nThen execute with:")
     print("  ./out")
+
+    print("\nTo assemble and link (Linux x86-64), run:")
+    print("  nasm -f elf64 out.asm -o out.o")
+    print("  ld out.o -o out")
 
     print("\nTo assemble and link (Windows x86-64), run:")
     print("  nasm -f pe64 out.asm -o out.o")
