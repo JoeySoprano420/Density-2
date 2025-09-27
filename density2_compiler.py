@@ -3,6 +3,8 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+import hashlib
 from typing import List, Tuple, Union, Dict, Optional
 
 # -----------------------------
@@ -1050,6 +1052,240 @@ class InlineBlock(Statement):
     def __repr__(self):
         return f"InlineBlock(lang={self.lang!r}, content_len={len(self.content)})"
 
+# -----------------------------
+# Runtime mutation tracking + history encoding (non-invasive, opt-in)
+# -----------------------------
+
+class _TrackedList(list):
+    """
+    List wrapper to track mutations on AST node list fields.
+    """
+    __slots__ = ('_owner', '_field')
+
+    def __init__(self, owner: 'ASTNode', field: str, iterable=None):
+        super().__init__(iterable or [])
+        self._owner = owner
+        self._field = field
+
+    def _rec(self, op: str, detail: Dict[str, object]):
+        if getattr(self._owner, '_track_mutations', False):
+            self._owner._record_mutation(op=op, field=self._field, before=None, after=None, detail=detail)
+
+    def append(self, item):
+        super().append(item)
+        self._rec('list.append', {'item': self._owner._brief(item)})
+
+    def extend(self, it):
+        vals = [self._owner._brief(v) for v in it]
+        super().extend(it)
+        self._rec('list.extend', {'items': vals})
+
+    def insert(self, index, item):
+        super().insert(index, item)
+        self._rec('list.insert', {'index': index, 'item': self._owner._brief(item)})
+
+    def pop(self, index=-1):
+        v = super().pop(index)
+        self._rec('list.pop', {'index': index, 'item': self._owner._brief(v)})
+        return v
+
+    def remove(self, item):
+        super().remove(item)
+        self._rec('list.remove', {'item': self._owner._brief(item)})
+
+    def clear(self):
+        n = len(self)
+        super().clear()
+        self._rec('list.clear', {'count': n})
+
+    def __setitem__(self, key, value):
+        if isinstance(key, slice):
+            before = [self._owner._brief(v) for v in self[key]]
+            super().__setitem__(key, value)
+            after = [self._owner._brief(v) for v in self[key]]
+            self._rec('list.setslice', {'slice': str(key), 'before': before, 'after': after})
+        else:
+            before = self._owner._brief(self[key]) if 0 <= key < len(self) else None
+            super().__setitem__(key, value)
+            self._rec('list.setitem', {'index': key, 'before': before, 'after': self._owner._brief(value)})
+
+    def __delitem__(self, key):
+        if isinstance(key, slice):
+            before = [self._owner._brief(v) for v in self[key]]
+            super().__delitem__(key)
+            self._rec('list.delslice', {'slice': str(key), 'before': before})
+        else:
+            before = self._owner._brief(self[key]) if 0 <= key < len(self) else None
+            super().__delitem__(key)
+            self._rec('list.delitem', {'index': key, 'before': before})
+
+
+# Keep original setattr so we can wrap and still call through.
+_ASTNODE_ORIG_SETATTR = ASTNode.__setattr__
+
+def _astnode_tracking_setattr(self: ASTNode, name: str, value):
+    # Never track private/internal attributes
+    if name.startswith('_'):
+        return _ASTNODE_ORIG_SETATTR(self, name, value)
+
+    # Wrap lists into tracked lists
+    if isinstance(value, list) and not isinstance(value, _TrackedList):
+        value = _TrackedList(self, name, value)
+
+    old_present = name in self.__dict__
+    old_value = self.__dict__.get(name, None)
+
+    # Set the attribute
+    _ASTNODE_ORIG_SETATTR(self, name, value)
+
+    # Record mutation if enabled and value actually changed (identity or repr inequality)
+    if getattr(self, '_track_mutations', False):
+        changed = (not old_present) or (old_value is not value)
+        if changed:
+            self._record_mutation(
+                op='setattr',
+                field=name,
+                before=self._brief(old_value) if old_present else None,
+                after=self._brief(value),
+                detail=None
+            )
+
+def _astnode_brief(self: ASTNode, v):
+    # Short, non-recursive summaries for history entries
+    if isinstance(v, ASTNode):
+        return v.__class__.__name__
+    if isinstance(v, _TrackedList):
+        return f'TrackedList(len={len(v)})'
+    if isinstance(v, list):
+        return f'list(len={len(v)})'
+    if isinstance(v, str):
+        s = v
+        return s if len(s) <= 32 else s[:29] + '...'
+    return v
+
+def _astnode_record_mutation(self: ASTNode, *, op: str, field: str, before, after, detail: Optional[Dict[str, object]]):
+    # Lazily create history storage
+    if '_history' not in self.__dict__:
+        _ASTNODE_ORIG_SETATTR(self, '_history', [])
+    event = {
+        'ts': time.time(),
+        'node': self.__class__.__name__,
+        'op': op,
+        'field': field,
+        'before': before,
+        'after': after,
+        'detail': detail or {}
+    }
+    self._history.append(event)
+
+def _astnode_wrap_lists(self: ASTNode):
+    # Ensure existing list fields are wrapped
+    for k, v in list(self.__dict__.items()):
+        if k.startswith('_'):
+            continue
+        if isinstance(v, list) and not isinstance(v, _TrackedList):
+            _ASTNODE_ORIG_SETATTR(self, k, _TrackedList(self, k, v))
+
+def _astnode_enable_mutation_tracking(self: ASTNode, enable: bool = True, recursive: bool = False) -> ASTNode:
+    # Initialize tracking flags/history lazily
+    if '_track_mutations' not in self.__dict__:
+        _ASTNODE_ORIG_SETATTR(self, '_track_mutations', False)
+    if '_history' not in self.__dict__:
+        _ASTNODE_ORIG_SETATTR(self, '_history', [])
+
+    _ASTNODE_ORIG_SETATTR(self, '_track_mutations', bool(enable))
+    if enable:
+        _astnode_wrap_lists(self)
+    if recursive:
+        for c in self.children():
+            c.enable_mutation_tracking(enable=True, recursive=True)
+    return self
+
+def _astnode_is_tracking(self: ASTNode) -> bool:
+    return bool(getattr(self, '_track_mutations', False))
+
+def _astnode_get_mutation_history(self: ASTNode, recursive: bool = False) -> List[Dict[str, object]]:
+    hist: List[Dict[str, object]] = list(getattr(self, '_history', []))
+    if recursive:
+        for c in self.children():
+            hist.extend(c.get_mutation_history(recursive=True))
+    # Sort by timestamp for a coherent timeline
+    hist.sort(key=lambda e: e.get('ts', 0.0))
+    return hist
+
+def _astnode_clear_mutation_history(self: ASTNode, recursive: bool = False):
+    if '_history' in self.__dict__:
+        self._history.clear()
+    if recursive:
+        for c in self.children():
+            c.clear_mutation_history(recursive=True)
+
+def _astnode_encode_history(self: ASTNode, recursive: bool = False, mode: str = 'compact') -> str:
+    """
+    Encode history into a compact ASCII stream.
+    - mode='compact': opCode|fieldHash|nodeCode per event, joined by ';'
+    """
+    events = self.get_mutation_history(recursive=recursive)
+    if not events:
+        return ''
+
+    # Map op -> single char
+    op_map = {
+        'setattr': 'S',
+        'list.append': 'A',
+        'list.extend': 'E',
+        'list.insert': 'I',
+        'list.pop': 'P',
+        'list.remove': 'X',
+        'list.clear': 'C',
+        'list.setitem': 'U',
+        'list.setslice': 'V',
+        'list.delitem': 'D',
+        'list.delslice': 'L',
+        'replace_child': 'R',
+    }
+    # Map node class to dodecagram digit when possible
+    node_to_code = {
+        'Program': '0', 'Function': '1', 'PrintStatement': '2', 'CIAMBlock': '3', 'MacroCall': '4',
+        'InlineBlock': '8'  # specific lang variants are compacted to 8 here
+    }
+
+    def h8(s: str) -> str:
+        # Short 8-hex hash for field names
+        return hashlib.sha1(s.encode('utf-8')).hexdigest()[:8]
+
+    parts: List[str] = []
+    for ev in events:
+        op_c = op_map.get(ev.get('op', ''), '?')
+        fld = str(ev.get('field', ''))
+        node_c = node_to_code.get(str(ev.get('node', '')), '9')
+        parts.append(f'{op_c}|{h8(fld)}|{node_c}')
+    return ';'.join(parts)
+
+# Monkey patch: add capabilities to ASTNode without altering existing API
+ASTNode._brief = _astnode_brief
+ASTNode._record_mutation = _astnode_record_mutation
+ASTNode.enable_mutation_tracking = _astnode_enable_mutation_tracking
+ASTNode.is_mutation_tracking_enabled = _astnode_is_tracking
+ASTNode.get_mutation_history = _astnode_get_mutation_history
+ASTNode.clear_mutation_history = _astnode_clear_mutation_history
+ASTNode.encode_history = _astnode_encode_history
+ASTNode.__setattr__ = _astnode_tracking_setattr
+
+# Also hook replace_child to record replacements as a mutation event
+_astnode_orig_replace_child = ASTNode.replace_child
+def _astnode_replace_child_tracked(self: ASTNode, old: 'ASTNode', new: Optional['ASTNode']) -> bool:
+    changed = _astnode_orig_replace_child(self, old, new)
+    if changed and getattr(self, '_track_mutations', False):
+        self._record_mutation(
+            op='replace_child',
+            field='(list/attr)',
+            before=self._brief(old),
+            after=self._brief(new),
+            detail=None
+        )
+    return changed
+ASTNode.replace_child = _astnode_replace_child_tracked
 
 # -----------------------------
 # Driver / Example usage
