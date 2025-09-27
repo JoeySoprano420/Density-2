@@ -1,5 +1,17 @@
 // Density 2 Hello World Program
 
 Main() {
+    '''SayHello(name)
+        Print: ("Hello, " + name + "!");
+    ,,,
+
+    #asm
+        mov eax, 60
+        xor edi, edi
+        syscall
+    #endasm
+
     Print: ("Hello, World!");
 }
+
+
