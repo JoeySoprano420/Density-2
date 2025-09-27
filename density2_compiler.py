@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 from typing import List, Tuple, Union, Dict, Optional
+from __future__ import annotations
 
 # -----------------------------
 # Token Definitions
