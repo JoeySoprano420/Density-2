@@ -97,3 +97,26 @@ That’s your Density 2 “Hello World + CIAM + Inline ASM” parsed into a tree
 
 That’s still valid Density 2 — the compiler will expand the `SayHello` CIAM at compile-time and splice the NASM directly into the generated assembly.
 ## _____
+
+Run and assemble
+python density2_compiler.py       # prints AST and NASM code
+nasm -f elf64 out.asm -o out.o    # assemble
+ld out.o -o out                   # link
+./out                             # run
+
+
+You should see:
+
+Hello, World!
+
+
+on stdout.
+
+At this point you have:
+
+Lexer + Parser → AST
+
+Code generator → real .asm file
+
+## _____
+
