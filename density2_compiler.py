@@ -165,9 +165,11 @@ class Parser:
 if __name__ == '__main__':
     code = '''
     Main() {
-        Print: ("Hello, World!");
+    Print: ("Hello, World!");
+    Print: ("Density 2!");
     }
     '''
+
     tokens = tokenize(code)
     parser = Parser(tokens)
     ast = parser.parse()
@@ -208,14 +210,32 @@ class CodeGenerator:
 
     def generate(self) -> str:
         self.lines = []
+        self.data_lines = []
+        self.string_table = {}
+        self.label_counter = 0
+
+        # generate code for functions first (which fills string_table)
         self._emit_header()
         for func in self.ast.functions:
             self._emit_function(func)
-        return '\n'.join(self.lines)
+
+        # build final assembly with real data section
+        final_lines = []
+        final_lines.append('section .data')
+        final_lines.extend('    ' + line for line in self.data_lines)
+        final_lines.append('section .text')
+        final_lines.append('    global _start')
+        # copy only the text part from lines after header
+        for l in self.lines[4:]:  # skip old header stub
+            final_lines.append(l)
+        return '\n'.join(final_lines)
+
 
     def _emit_header(self):
         self.lines.append('section .data')
-        self.lines.append('    hello_msg db "Hello, World!", 10, 0')
+        # data_lines will be filled later when printing
+        # so we leave it empty for now
+        self.lines.append('; string data will be inserted here later')
         self.lines.append('section .text')
         self.lines.append('    global _start')
 
@@ -238,15 +258,33 @@ class CodeGenerator:
             self._emit_exit()
 
     def _emit_print(self, text: str):
-        # For now always print our static hello_msg for demonstration
-        self.lines.append('    mov rax, 1          ; sys_write')
-        self.lines.append('    mov rdi, 1          ; stdout')
-        self.lines.append('    mov rsi, hello_msg  ; message')
-        self.lines.append('    mov rdx, 14         ; length')
+        label = self._get_string_label(text)
+        length = len(text) + 1  # + newline
+        self.lines.append(f'    mov rax, 1          ; sys_write')
+        self.lines.append(f'    mov rdi, 1          ; stdout')
+        self.lines.append(f'    mov rsi, {label}    ; message')
+        self.lines.append(f'    mov rdx, {length}         ; length')
         self.lines.append('    syscall')
 
     def _emit_exit(self):
         self.lines.append('    mov rax, 60         ; sys_exit')
         self.lines.append('    xor rdi, rdi        ; status 0')
         self.lines.append('    syscall')
+
+class CodeGenerator:
+    def __init__(self, ast: Program):
+        self.ast = ast
+        self.lines = []
+        self.data_lines = []
+        self.string_table = {}  # map string -> label
+        self.label_counter = 0
+
+    def _get_string_label(self, text: str) -> str:
+        if text not in self.string_table:
+            label = f'str_{self.label_counter}'
+            self.label_counter += 1
+            # create a null-terminated string with newline
+            self.data_lines.append(f'{label} db {repr(text)[1:-1]!r}, 10, 0')
+            self.string_table[text] = label
+        return self.string_table[text]
 
