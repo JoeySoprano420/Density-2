@@ -41,5 +41,11 @@ Main() {
 }
 ```
 
+
+Save as density2_compiler.py, run:
+
+python density2_compiler.py
+
+
 That’s still valid Density 2 — the compiler will expand the `SayHello` CIAM at compile-time and splice the NASM directly into the generated assembly.
 
