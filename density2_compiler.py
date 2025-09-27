@@ -5,14 +5,14 @@ from typing import List, Tuple, Union
 # Token Definitions
 # -----------------------------
 TOKEN_SPECIFICATION = [
-    ('CIAM_START', r"'''"),            # start of CIAM
-    ('CIAM_END', r",,,"),
-    ('INLINE_START', r"#(asm|c|python)?"),  # start of inline block
-    ('INLINE_END', r"#end\1"),         # will be replaced dynamically
-    ('COMMENT', r'//[^\n]*'),          # single-line comment
-    ('MCOMMENT', r'/\*.*?\*/'),        # multi-line comment
-    ('STRING', r'"(?:\\.|[^"\\])*"'),  # string literal
-    ('IDENT', r'[A-Za-z_][A-Za-z0-9_]*'), # identifiers and keywords
+    ('CIAM', r"'''(.*?),,,"),
+    ('INLINE_ASM', r"#asm(.*?)#endasm"),
+    ('INLINE_C', r"#c(.*?)#endc"),
+    ('INLINE_PY', r"#python(.*?)#endpython"),
+    ('COMMENT', r'//[^\n]*'),
+    ('MCOMMENT', r'/\*.*?\*/'),
+    ('STRING', r'"(?:\\.|[^"\\])*"'),
+    ('IDENT', r'[A-Za-z_][A-Za-z0-9_]*'),
     ('LBRACE', r'\{'),
     ('RBRACE', r'\}'),
     ('LPAREN', r'\('),
@@ -20,9 +20,10 @@ TOKEN_SPECIFICATION = [
     ('COLON', r':'),
     ('SEMICOLON', r';'),
     ('NEWLINE', r'\n'),
-    ('SKIP', r'[ \t]+'),               # spaces/tabs
-    ('MISMATCH', r'.'),                # any other character
+    ('SKIP', r'[ \t]+'),
+    ('MISMATCH', r'.'),
 ]
+
 
 token_regex = '|'.join('(?P<%s>%s)' % pair for pair in TOKEN_SPECIFICATION)
 
@@ -121,6 +122,27 @@ class Parser:
     def parse_statements(self) -> List[ASTNode]:
         stmts = []
         while self.peek() and self.peek().type != 'RBRACE':
+            tok = self.peek()
+            if tok.type == 'IDENT' and tok.value == 'Print':
+                stmts.append(self.parse_print())
+            elif tok.type == 'CIAM':
+                ciam_tok = self.consume('CIAM')
+                content = ciam_tok.value[3:-3] if ciam_tok.value.startswith("'''") else ciam_tok.value
+                stmts.append(CIAMBlock(content.strip()))
+            elif tok.type.startswith('INLINE_'):
+                lang = tok.type.split('_', 1)[1].lower()  # asm/c/py
+                inline_tok = self.consume(tok.type)
+                # strip off #lang and #endlang markers:
+                content = re.sub(r'^#\w+', '', inline_tok.value, flags=re.DOTALL)
+                content = re.sub(r'#end\w+$', '', content, flags=re.DOTALL)
+                stmts.append(InlineBlock(lang, content.strip()))
+            else:
+                self.pos += 1
+        return stmts
+    
+    def parse_statements(self) -> List[ASTNode]:
+        stmts = []
+        while self.peek() and self.peek().type != 'RBRACE':
             if self.peek().type == 'IDENT' and self.peek().value == 'Print':
                 stmts.append(self.parse_print())
             else:
@@ -156,3 +178,17 @@ if __name__ == '__main__':
     ast = parser.parse()
     print("\nAST:")
     print(ast)
+
+class CIAMBlock(ASTNode):
+    def __init__(self, content: str):
+        self.content = content
+    def __repr__(self):
+        return f"CIAMBlock({self.content!r})"
+
+class InlineBlock(ASTNode):
+    def __init__(self, lang: str, content: str):
+        self.lang = lang
+        self.content = content
+    def __repr__(self):
+        return f"InlineBlock(lang={self.lang!r}, content={self.content!r})"
+
