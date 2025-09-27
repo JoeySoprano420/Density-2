@@ -4,7 +4,6 @@ import shutil
 import subprocess
 import tempfile
 from typing import List, Tuple, Union, Dict, Optional
-from __future__ import annotations
 
 # -----------------------------
 # Token Definitions
@@ -793,3 +792,29 @@ emit("mov rdi, 1")
         f.write(asm)
     print("\nWritten to out.asm")
 
+    print("\nTo assemble and link (Linux x86-64), run:")
+    print("  nasm -f elf64 out.asm -o out.o")
+    print("  ld out.o -o out")
+
+    print("\nThen execute with:")
+    print("  ./out")
+
+    print("\nTo assemble and link (Linux x86-64), run:")
+    print("  nasm -f elf64 out.asm -o out.o")
+    print("  ld out.o -o out")
+
+    print("\nTo assemble and link (Windows x86-64), run:")
+    print("  nasm -f pe64 out.asm -o out.o")
+    print("  ld out.o -o out")
+
+    print("\nThen execute with:")
+    print("  out.exe")
+
+    print("\nTo assemble and link (macOS x86-64), run:")
+    print("  nasm -f macho64 out.asm -o out.o")
+    print("  ld -macosx_version_min 10.13 -e _start -lSystem -o out out.o")
+
+    print("\nThen execute with:")
+    print("  ./out")
+
+    # End of density2_compiler.py
