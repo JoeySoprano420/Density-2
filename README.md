@@ -70,6 +70,30 @@ Program([Function(Main, body=[CIAMBlock('SayHello(name)\n        Print: ("Hello,
 
 This is a real parser for Density 2 Hello World + CIAM + inline code with no placeholders or pass. From here you can walk the AST and generate NASM or C accordingly.
 
+you now have a real front-end that tokenises, parses and produces an AST containing three distinct node types:
+
+PrintStatement for normal Density 2 statements
+
+CIAMBlock for your compile-time macros
+
+InlineBlock for embedded NASM/C/Python
+
+When you run the test program I showed, your console should print something like:
+
+AST:
+Program([Function(Main,
+  body=[
+    CIAMBlock('SayHello(name)\n        Print: ("Hello, " + name + "!");'),
+    InlineBlock(lang='asm', content='mov eax, 60\n        xor edi, edi\n        syscall'),
+    Print(Hello, World!)
+  ])
+])
+
+
+That’s your Density 2 “Hello World + CIAM + Inline ASM” parsed into a tree you can walk.
+
+## _____
+
 
 That’s still valid Density 2 — the compiler will expand the `SayHello` CIAM at compile-time and splice the NASM directly into the generated assembly.
-
+## _____
