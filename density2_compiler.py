@@ -250,12 +250,31 @@ class CodeGenerator:
             elif isinstance(stmt, CIAMBlock):
                 # naïve: just put comment for now; expansion can be added later
                 self.lines.append(f'; CIAMBlock ignored: {stmt.content}')
+                def _emit_function(self, func: Function):
+        if func.name == 'Main':
+            self.lines.append('_start:')
+        else:
+            self.lines.append(f'{func.name}:')
+
+        for stmt in func.body:
+            if isinstance(stmt, PrintStatement):
+                self._emit_print(stmt.text)
+            elif isinstance(stmt, CIAMBlock):
+                # For now, just emit as comment until you implement expansion
+                self.lines.append(f'    ; CIAMBlock ignored: {stmt.content}')
             elif isinstance(stmt, InlineBlock):
-                self.lines.append(f'; inline {stmt.lang} start')
-                self.lines.append(stmt.content)
-                self.lines.append(f'; inline {stmt.lang} end')
+                if stmt.lang == 'asm':
+                    self.lines.append(f'    ; inline NASM start')
+                    # inject each line of the assembly content literally
+                    for line in stmt.content.splitlines():
+                        self.lines.append('    ' + line.strip())
+                    self.lines.append(f'    ; inline NASM end')
+                else:
+                    # for other langs, leave as comment for now
+                    self.lines.append(f'    ; inline {stmt.lang} block skipped')
         if func.name == 'Main':
             self._emit_exit()
+
 
     def _emit_print(self, text: str):
         label = self._get_string_label(text)
