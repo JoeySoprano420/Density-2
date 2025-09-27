@@ -160,6 +160,75 @@ Output:
 Hello, World!
 Density 2!
 
+Test with a .den file containing inline NASM
+Main() {
+    Print: ("Hello, World!");
+
+    #asm
+        mov rax, 1
+        mov rdi, 1
+        mov rsi, str_0
+        mov rdx, 14
+        syscall
+    #endasm
+
+    Print: ("After inline NASM");
+}
+
+Run the compiler
+python density2_compiler.py
+nasm -f elf64 out.asm -o out.o
+ld out.o -o out
+./out
+
+
+The generated out.asm will look something like:
+
+section .data
+    str_0 db "Hello, World!", 10, 0
+    str_1 db "After inline NASM", 10, 0
+section .text
+    global _start
+_start:
+    mov rax, 1          ; sys_write
+    mov rdi, 1          ; stdout
+    mov rsi, str_0    ; message
+    mov rdx, 14         ; length
+    syscall
+    ; inline NASM start
+    mov rax, 1
+    mov rdi, 1
+    mov rsi, str_0
+    mov rdx, 14
+    syscall
+    ; inline NASM end
+    mov rax, 1          ; sys_write
+    mov rdi, 1          ; stdout
+    mov rsi, str_1    ; message
+    mov rdx, 18         ; length
+    syscall
+    mov rax, 60         ; sys_exit
+    xor rdi, rdi        ; status 0
+    syscall
+
+    When you assemble and run it, the inline assembly runs directly after the first print, then the normal second print.
+
+    Now you have:
+
+Print: generates its own string labels.
+
+CIAM: stored in AST ready for future macro expansion.
+
+Inline NASM: injected literally into .text.
+
+
+
+
+## _____
+
+
+
+
 
 This gives you a real end-to-end pipeline: Density 2 .den file → AST → .asm → executable.
 
