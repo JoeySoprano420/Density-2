@@ -1,0 +1,5 @@
+// Density 2 Hello World Program
+
+Main() {
+    Print: ("Hello, World!");
+}
