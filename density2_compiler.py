@@ -111,7 +111,228 @@ def tokenize(code: str) -> List[Token]:
 # AST Nodes
 # -----------------------------
 class ASTNode:
-    pass
+    """
+    Base class for all Density 2 AST nodes.
+
+    Features:
+    - Optional source position tracking: filename, (line, col) -> (end_line, end_col)
+    - Child discovery: children() finds nested AST nodes and lists of nodes
+    - Traversal: walk() yields nodes in preorder
+    - Visitor pattern: accept(visitor) calls visitor.visit_<Type>(self) or visitor.visit(self)
+    - Structural replace: replace_child(old, new) updates direct attributes/lists
+    - Serialization: to_dict()/pretty() for debugging and tooling
+    - Copy: copy(**overrides) for shallow cloning
+    - Dodecagram encoding: to_dodecagram() uses global ast_to_dodecagram if available
+    - Structural equality: __eq__ based on type and serialized content (excluding positions)
+    """
+
+    # Position information is optional and can be set later via set_pos().
+    def __init__(
+        self,
+        *,
+        filename: Optional[str] = None,
+        line: Optional[int] = None,
+        col: Optional[int] = None,
+        end_line: Optional[int] = None,
+        end_col: Optional[int] = None,
+    ):
+        self.filename = filename
+        self.line = line
+        self.col = col
+        self.end_line = end_line
+        self.end_col = end_col
+
+    # ----- Source position helpers -----
+    def set_pos(
+        self,
+        *,
+        filename: Optional[str] = None,
+        line: Optional[int] = None,
+        col: Optional[int] = None,
+        end_line: Optional[int] = None,
+        end_col: Optional[int] = None,
+    ) -> "ASTNode":
+        if filename is not None:
+            self.filename = filename
+        if line is not None:
+            self.line = line
+        if col is not None:
+            self.col = col
+        if end_line is not None:
+            self.end_line = end_line
+        if end_col is not None:
+            self.end_col = end_col
+        return self
+
+    # ----- Introspection helpers -----
+    def _is_pos_field(self, name: str) -> bool:
+        return name in ("filename", "line", "col", "end_line", "end_col")
+
+    def _iter_fields(self):
+        # Do not consider private/dunder attributes as AST data
+        for k, v in self.__dict__.items():
+            if k.startswith("_"):
+                continue
+            yield k, v
+
+    def children(self) -> List["ASTNode"]:
+        """Return direct child AST nodes (flattening lists)."""
+        result: List[ASTNode] = []
+        for _, v in self._iter_fields():
+            if isinstance(v, ASTNode):
+                result.append(v)
+            elif isinstance(v, list):
+                for it in v:
+                    if isinstance(it, ASTNode):
+                        result.append(it)
+        return result
+
+    def walk(self):
+        """Preorder traversal of this subtree."""
+        yield self
+        for c in self.children():
+            yield from c.walk()
+
+    # ----- Visitor pattern -----
+    def accept(self, visitor):
+        """Call visitor.visit_<Type>(self) if present, else visitor.visit(self) if present."""
+        method = getattr(visitor, f"visit_{self.__class__.__name__}", None)
+        if callable(method):
+            return method(self)
+        generic = getattr(visitor, "visit", None)
+        if callable(generic):
+            return generic(self)
+        return None
+
+    # ----- Structural operations -----
+    def replace_child(self, old: "ASTNode", new: Optional["ASTNode"]) -> bool:
+        """
+        Replace a direct child 'old' with 'new'.
+        If 'new' is None, removes the child if it's in a list; clears attribute otherwise.
+        Returns True if a replacement/removal occurred.
+        """
+        changed = False
+        for k, v in list(self._iter_fields()):
+            if isinstance(v, ASTNode):
+                if v is old:
+                    setattr(self, k, new)
+                    changed = True
+            elif isinstance(v, list):
+                # Replace in lists; remove if new is None
+                new_list = []
+                for it in v:
+                    if it is old:
+                        if new is not None:
+                            new_list.append(new)
+                        changed = True
+                    else:
+                        new_list.append(it)
+                if changed:
+                    setattr(self, k, new_list)
+        return changed
+
+    # ----- Serialization / Debugging -----
+    def to_dict(self, *, include_pos: bool = True) -> Dict[str, object]:
+        """Convert the node (recursively) to a dict suitable for JSON/debugging."""
+        d: Dict[str, object] = {"__type__": self.__class__.__name__}
+        for k, v in self._iter_fields():
+            if not include_pos and self._is_pos_field(k):
+                continue
+            if isinstance(v, ASTNode):
+                d[k] = v.to_dict(include_pos=include_pos)
+            elif isinstance(v, list):
+                d[k] = [
+                    (it.to_dict(include_pos=include_pos) if isinstance(it, ASTNode) else it)
+                    for it in v
+                ]
+            else:
+                d[k] = v
+        return d
+
+    def pretty(self, indent: str = "  ") -> str:
+        """Human-readable multi-line tree dump."""
+        lines: List[str] = []
+
+        def rec(n: "ASTNode", depth: int):
+            pad = indent * depth
+            header = n.__class__.__name__
+            pos = []
+            if n.filename:
+                pos.append(f'file="{n.filename}"')
+            if n.line is not None and n.col is not None:
+                pos.append(f"@{n.line}:{n.col}")
+            if n.end_line is not None and n.end_col is not None:
+                pos.append(f"-{n.end_line}:{n.end_col}")
+            if pos:
+                header += " [" + " ".join(pos) + "]"
+            lines.append(pad + header)
+
+            # Show scalar fields
+            for k, v in n._iter_fields():
+                if isinstance(v, ASTNode):
+                    continue
+                if isinstance(v, list) and any(isinstance(it, ASTNode) for it in v):
+                    continue
+                lines.append(pad + indent + f"{k} = {v!r}")
+
+            # Recurse into child nodes
+            for k, v in n._iter_fields():
+                if isinstance(v, ASTNode):
+                    lines.append(pad + indent + f"{k}:")
+                    rec(v, depth + 2)
+                elif isinstance(v, list):
+                    child_nodes = [it for it in v if isinstance(it, ASTNode)]
+                    if child_nodes:
+                        lines.append(pad + indent + f"{k}: [{len(child_nodes)}]")
+                        for it in child_nodes:
+                            rec(it, depth + 2)
+
+        rec(self, 0)
+        return "\n".join(lines)
+
+    def copy(self, **overrides):
+        """
+        Shallow copy with optional field overrides:
+            new = node.copy(body=new_body)
+        """
+        cls = self.__class__
+        new_obj = cls.__new__(cls)  # type: ignore
+        # Copy all instance attributes
+        new_obj.__dict__.update(self.__dict__)
+        # Apply overrides
+        for k, v in overrides.items():
+            setattr(new_obj, k, v)
+        return new_obj
+
+    def to_dodecagram(self) -> str:
+        """
+        Encode this node (and subtree) using the Dodecagram mapping.
+        Relies on a global function ast_to_dodecagram(node).
+        """
+        f = globals().get("ast_to_dodecagram")
+        if callable(f):
+            return f(self)  # type: ignore[misc]
+        raise RuntimeError("ast_to_dodecagram() is not available in this module")
+
+    # ----- Equality / Representation -----
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ASTNode):
+            return False
+        if self.__class__ is not other.__class__:
+            return False
+        return self.to_dict(include_pos=False) == other.to_dict(include_pos=False)
+
+    def __repr__(self) -> str:
+        # Compact representation showing scalar fields only
+        fields: List[str] = []
+        for k, v in self._iter_fields():
+            if isinstance(v, ASTNode):
+                continue
+            if isinstance(v, list) and any(isinstance(it, ASTNode) for it in v):
+                continue
+            fields.append(f"{k}={v!r}")
+        inner = ", ".join(fields)
+        return f"{self.__class__.__name__}({inner})"
 
 
 class Program(ASTNode):
@@ -132,6 +353,7 @@ class Function(ASTNode):
 
 
 class Statement(ASTNode):
+    """Base class for all statements in Density 2."""
     pass
 
 
@@ -170,6 +392,56 @@ class InlineBlock(Statement):
     def __repr__(self):
         return f"InlineBlock(lang={self.lang!r}, content_len={len(self.content)})"
 
+
+# -----------------------------
+# Dodecagram AST encoding
+# -----------------------------
+_DODECAGRAM_MAP = {
+    'Program': '0',
+    'Function': '1',
+    'PrintStatement': '2',
+    'CIAMBlock': '3',
+    'MacroCall': '4',
+    # InlineBlock variants:
+    'InlineBlock:asm': '5',
+    'InlineBlock:python': '6',
+    'InlineBlock:py': '6',
+    'InlineBlock:c': '7',
+    'InlineBlock:other': '8',
+    # Reserved for future nodes:
+    '_reserved9': '9',
+    '_reserveda': 'a',
+    '_reservedb': 'b',
+}
+
+def ast_to_dodecagram(node: ASTNode) -> str:
+    """
+    Preorder encoding of the AST using the Dodecagram alphabet 0-9,a,b.
+    """
+    def enc(n: ASTNode) -> str:
+        if isinstance(n, Program):
+            s = _DODECAGRAM_MAP['Program']
+            for f in n.functions:
+                s += enc(f)
+            return s
+        if isinstance(n, Function):
+            s = _DODECAGRAM_MAP['Function']
+            for st in n.body:
+                s += enc(st)
+            return s
+        if isinstance(n, PrintStatement):
+            return _DODECAGRAM_MAP['PrintStatement']
+        if isinstance(n, CIAMBlock):
+            return _DODECAGRAM_MAP['CIAMBlock']
+        if isinstance(n, MacroCall):
+            return _DODECAGRAM_MAP['MacroCall']
+        if isinstance(n, InlineBlock):
+            key = f'InlineBlock:{n.lang}'
+            ch = _DODECAGRAM_MAP.get(key, _DODECAGRAM_MAP['InlineBlock:other'])
+            return ch
+        # Unknown node -> reserved
+        return _DODECAGRAM_MAP['_reserved9']
+    return enc(node)
 
 # -----------------------------
 # Parser
@@ -458,18 +730,16 @@ class CodeGenerator:
         self.data_lines: List[str] = []
         self.string_table: Dict[str, str] = {}  # map string -> label
         self.label_counter = 0
+        # simple register reuse cache (invalidated across inline blocks)
+        self._reg_cache = {'rax_sys_write': False, 'rdi_stdout': False}
 
     def generate(self) -> str:
-        # Expand macros (compile-time)
-        if isinstance(self.ast, Program):
-            # macros already expanded in compile_density2
-            pass
-
-        # Emit
+        # Expand macros already done in compile_density2
         self.text_lines = []
         self.data_lines = []
         self.string_table = {}
         self.label_counter = 0
+        self._invalidate_reg_cache()
 
         # Header and functions
         self._emit_header()
@@ -487,6 +757,10 @@ class CodeGenerator:
 
         return '\n'.join(final_lines)
 
+    def _invalidate_reg_cache(self):
+        self._reg_cache['rax_sys_write'] = False
+        self._reg_cache['rdi_stdout'] = False
+
     def _emit_header(self):
         # Add a small banner; sections are assembled at the end
         self.text_lines.append('; --- Density 2 NASM output ---')
@@ -499,18 +773,22 @@ class CodeGenerator:
             self.text_lines.append('_start:')
         else:
             self.text_lines.append(f'{func.name}:')
+        # function entry: registers not assumed
+        self._invalidate_reg_cache()
 
         for stmt in func.body:
             if isinstance(stmt, PrintStatement):
                 self._emit_print(stmt.text)
             elif isinstance(stmt, InlineBlock):
                 self._emit_inline(stmt)
+                # assume inline code may clobber registers
+                self._invalidate_reg_cache()
             elif isinstance(stmt, CIAMBlock):
                 # Already handled by expand_macros; leave a comment in case any remain
-                self.text_lines.append(f'    ; CIAMBlock ignored (should be expanded): {stmt.name}')
+                self.text_lines.append(f'    ; CIAMBlock ignored (should be expanded): {getattr(stmt, "name", "?")}')
             elif isinstance(stmt, MacroCall):
                 # Should be expanded away
-                self.text_lines.append(f'    ; MacroCall ignored (should be expanded): {stmt.name}')
+                self.text_lines.append(f'    ; MacroCall ignored (should be expanded): {getattr(stmt, "name", "?")}')
             else:
                 # Unknown statement type
                 self.text_lines.append('    ; Unknown statement')
@@ -541,16 +819,24 @@ class CodeGenerator:
 
     def _emit_print(self, text: str):
         label, length = self._get_string_label(text)
-        self.text_lines.append(f'    mov rax, 1          ; sys_write')
-        self.text_lines.append(f'    mov rdi, 1          ; stdout')
+        # register reuse: avoid redundant loads across consecutive prints
+        if not self._reg_cache['rax_sys_write']:
+            self.text_lines.append(f'    mov rax, 1          ; sys_write')
+            self._reg_cache['rax_sys_write'] = True
+        if not self._reg_cache['rdi_stdout']:
+            self.text_lines.append(f'    mov rdi, 1          ; stdout')
+            self._reg_cache['rdi_stdout'] = True
         self.text_lines.append(f'    mov rsi, {label}    ; message')
         self.text_lines.append(f'    mov rdx, {length}         ; length (bytes)')
         self.text_lines.append('    syscall')
+        # after syscall, rax/rdi are still fine for subsequent prints in our model
 
     def _emit_exit(self):
         self.text_lines.append('    mov rax, 60         ; sys_exit')
         self.text_lines.append('    xor rdi, rdi        ; status 0')
         self.text_lines.append('    syscall')
+        # invalidate cache after exit emitter
+        self._invalidate_reg_cache()
 
     def _emit_inline(self, block: InlineBlock):
         if block.lang == 'asm':
@@ -596,14 +882,13 @@ class CodeGenerator:
             self.label_counter += 1
             return lbl
 
-        # Very restricted globals/locals
         globals_dict = {
             '__builtins__': {
                 'range': range,
                 'len': len,
                 'str': str,
                 'int': int,
-                'print': print,  # debug if needed
+                'print': print,
             },
             'emit': emit,
             'label': label,
@@ -632,14 +917,14 @@ class CodeGenerator:
             with open(c_path, 'w', encoding='utf-8') as f:
                 f.write(c_code)
 
-            cmd: List[str]
             if compiler == 'tcc':
-                # tcc can emit assembly with -S
                 cmd = [compiler, '-nostdlib', '-S', c_path, '-o', asm_path]
             elif compiler == 'clang':
-                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path,
+                       '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
             else:  # gcc
-                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path,
+                       '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
 
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -649,16 +934,12 @@ class CodeGenerator:
             with open(asm_path, 'r', encoding='utf-8', errors='ignore') as f:
                 raw = f.read()
 
-            # Attempt to translate AT&T/Intel output to NASM
             translated = self._translate_att_to_nasm(raw)
             if translated:
                 return translated
 
-            # Fallback to comments if translation failed
-            commented = []
-            commented.append('; [begin compiled C assembly]')
-            for line in raw.splitlines():
-                commented.append('; ' + line)
+            commented = ['; [begin compiled C assembly]']
+            commented += ['; ' + line for line in raw.splitlines()]
             commented.append('; [end compiled C assembly]')
             return commented
         except Exception as ex:
@@ -670,7 +951,6 @@ class CodeGenerator:
                 pass
 
     # --- AT&T -> NASM best-effort translation helpers ---
-
     def _translate_att_to_nasm(self, att_asm: str) -> List[str]:
         out: List[str] = []
         for line in att_asm.splitlines():
@@ -678,7 +958,6 @@ class CodeGenerator:
             if not s:
                 continue
 
-            # Ignore sectioning and many metadata directives
             if s.startswith('.'):
                 if s.startswith(('.globl', '.global', '.text', '.data', '.bss', '.rodata', '.section',
                                  '.type', '.size', '.file', '.ident', '.cfi', '.p2align', '.intel_syntax', '.att_syntax')):
@@ -686,12 +965,10 @@ class CodeGenerator:
                 out.append(f'; {s}')
                 continue
 
-            # Preserve labels
             if s.endswith(':'):
                 out.append(s)
                 continue
 
-            # Remove trailing comments
             s = s.split('\t#', 1)[0].split(' #', 1)[0].strip()
             if not s:
                 continue
@@ -699,12 +976,11 @@ class CodeGenerator:
             parts = s.split(None, 1)
             op = parts[0]
             rest = parts[1] if len(parts) > 1 else ''
-            op_n = re.sub(r'(q|l|w|b)$', '', op)  # drop size suffix
+            op_n = re.sub(r'(q|l|w|b)$', '', op)
 
             ops = [o.strip() for o in rest.split(',')] if rest else []
             ops = [self._att_operand_to_nasm(o) for o in ops]
 
-            # Reverse operand order for two-operand instructions
             if len(ops) == 2:
                 ops = [ops[1], ops[0]]
 
@@ -717,13 +993,10 @@ class CodeGenerator:
 
     def _att_operand_to_nasm(self, o: str) -> str:
         o = o.strip()
-        # Immediate: $val -> val
         if o.startswith('$'):
             return o[1:]
-        # Registers: %rax -> rax
         o = re.sub(r'%([a-zA-Z][a-zA-Z0-9]*)', r'\1', o)
 
-        # RIP-relative like foo(%rip) or disp(%reg,idx,scale)
         m = re.match(r'^\s*([\-+]?\d+)?\s*\(\s*([a-zA-Z0-9%]+)\s*(?:,\s*([a-zA-Z0-9%]+)\s*(?:,\s*(\d+))?)?\s*\)\s*$', o)
         if m:
             disp, base, index, scale = m.groups()
@@ -739,8 +1012,43 @@ class CodeGenerator:
                 addr = f'{addr} {sign} {abs(int(disp))}' if addr else str(disp)
             return f'[{addr}]'
 
-        # Bare symbol or already simple
         return o
+
+
+class PrintStatement(Statement):
+    def __init__(self, text: str):
+        self.text = text
+
+    def __repr__(self):
+        return f"Print({self.text!r})"
+
+
+class CIAMBlock(Statement):
+    def __init__(self, name: str, params: List[str], body_text: str):
+        self.name = name
+        self.params = params
+        self.body_text = body_text  # raw Density 2 snippet
+
+    def __repr__(self):
+        return f"CIAMBlock(name={self.name!r}, params={self.params}, body_len={len(self.body_text)})"
+
+
+class MacroCall(Statement):
+    def __init__(self, name: str, arg_texts: List[str]):
+        self.name = name
+        self.arg_texts = arg_texts  # raw argument texts
+
+    def __repr__(self):
+        return f"MacroCall({self.name!r}, args={self.arg_texts})"
+
+
+class InlineBlock(Statement):
+    def __init__(self, lang: str, content: str):
+        self.lang = lang  # 'asm', 'c', 'python'
+        self.content = content
+
+    def __repr__(self):
+        return f"InlineBlock(lang={self.lang!r}, content_len={len(self.content)})"
 
 
 # -----------------------------
@@ -818,3 +1126,5 @@ emit("mov rdi, 1")
     print("  ./out")
 
     # End of density2_compiler.py
+
+
