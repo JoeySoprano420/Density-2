@@ -1,5 +1,131 @@
 # Density-2
 
+Here’s a clear **first-cut spec** for *Density 2* based on what you wrote. I’ve broken it into layers so you can see at a glance how the language is supposed to behave and how it’s different from v1.0:
+
+---
+
+## 1. Core Identity
+
+* **Name:** Density 2
+* **File Extension:** `.den`
+* **Philosophy:** “Terms and signs mutually universal” — syntax that looks natural to C/Python/NASM but is strongly typed like a systems language.
+* **Execution:** AOT compile to NASM → link to PE/.exe or ELF.
+* **Grammar Source:** Written in Dodecagrams (base-12, digits `0-9,a,b`).
+
+---
+
+## 2. Syntax Highlights
+
+```density2
+Main() Print: ("Hello, World!");
+
+ // single-line comment  
+
+ /* multi-line
+    comment */
+
+ '''CIAM … ,,,       // Contextually Inferred Abstraction Macro  
+
+ #...#              // inline C / NASM / Python / Dodecagrams
+```
+
+* **Single line comments:** `//`
+* **Multi-line comments:** `/* … */`
+* **CIAMS (new):** `'''…,,,` separate from comments — macros expanded at compile time.
+* **Inline foreign code:** `#…#` to embed NASM, C, Python, or Dodecagram.
+
+---
+
+## 3. Typing & Semantics
+
+* **Dual mode:** *Explicitly mutable, strongly dynamic* but also *immutably intrinsic static* where annotated.
+* **Universal semantics:** Keywords match Python/C/NASM meaning 1-to-1.
+* **.den files** compile directly without glue code.
+
+---
+
+## 4. Error / Memory Keywords
+
+* Error flow: `try, catch, raise, flag, throws, except, noexcept, ignore, suppress, avoid, skip, isolate, warning`.
+* Memory: `alloc, free, collect, sweeps, register, store, release, delete, malloc, stack, heap, assign, allow, hold, deny, lease, carry, void, check, match, local, deallocate`.
+
+---
+
+## 5. Built-ins & Structures
+
+Primitives, types, flows, keywords, structs, tuples, lists, arrays, vectors, nests, branches, directives, qualifiers, states, conditionals, booleans, operators, checkpoints, breaks, suspend, lookahead, peephole, profile guidance, index, constant folding, flattening, loop unrolling, compression, condensing, mutex, recall, rollback, slices, parallelism, single & multithreading, calls, I/O, imports, exports, renders, compile, link, map, interpret, interface, exchange, ping, setup, network, publish, read, scan, collect, run, fuse, channel, adopt, adaptability, durations, closures, support, dictionary, ruleset, delineate, exponent, variables, values, negate, floats, decimals, strings, nulls, pointers, blocks, classes, methods, modules, items, partitions, handles, scaling, weights, range, delimiters, punctuation, whitespace, indents, force, limiter, bounds, parameters, scope, text, comments, bridge, relationships, context, iterate, fringe, risks, eval, enums, escape, end, packet, encapsulate, grouping, match, batch, equivalents, instances, hierarchies, schedules, async, await, ask, reply, print, return, math, include, add, mult, synchronized, polynomials, polymorphism, div, sub, div-by-zero, align, position, resource, runtime, aware, navigate, process, pause, resume, consume, conversions, probabilities, measure, temp, trees, chains, webs, learn, traffic, busy, clear, available, sharp, dull, encryption, decrypt, obfuscate, deobfuscate, detect, cipher, decipher, fibonacci, sequence, pattern, linear, non-linear, equation, paradox, pairings, coupling, history, prediction, solve.
+
+*(This list becomes the official keyword namespace of Density 2.)*
+
+---
+
+## 6. CIAMs (Contextually Inferred Abstraction Macros)
+
+* Think of them as macro-templates.
+
+* Syntax:
+
+  ```density2
+  '''MacroName(parameters)
+     body...
+  ,,,
+  ```
+
+* Expanded at compile time, not comments, not run-time.
+
+* Can generate NASM, C, Python, or Dodecagram code inside the compiler pipeline.
+
+---
+
+## 7. Inline Foreign Code
+
+Example:
+
+```density2
+Main() {
+    #asm
+        mov eax,1
+    #endasm
+
+    #c
+        printf("Hello from C\n");
+    #endc
+}
+```
+
+The compiler directly splices these into the NASM backend during codegen.
+
+---
+
+## 8. Immediate Next Steps
+
+1. **Define tokens**: comment vs CIAM vs inline blocks.
+2. **Build a lexer** recognizing:
+
+   * Identifiers, keywords, punctuation
+   * `'''…,,,` CIAM blocks
+   * `#…#` inline foreign code blocks
+3. **Grammar**: Use Dodecagram base-12 codes for AST nodes.
+4. **Emit**: NASM directly with an AOT pipeline → PE/ELF.
+5. **Testing**: Start with simple `Main() Print:("Hello")` → .exe.
+
+---
+
+### Example Flow:
+
+```density2
+Main() {
+    Print:("Hello, World!");
+    try {
+        #python print("Inline python") #
+    } catch (Error e) {
+        Print:(e);
+    }
+}
+```
+
+---
+
 Here’s what a minimal **“Hello, World!”** looks like in the Density 2 syntax you just defined, using only the rules you gave (single-line comments with `//`, multi-line comments with `/*…*/`, CIAMs with `'''…,,,`, and optional inline code with `#…#`):
 
 ```density2
