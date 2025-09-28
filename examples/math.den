@@ -23,7 +23,7 @@ emit("imul rax, rbx")
 '''Divide(a, b)
 #python
 emit(f"mov rax, {a}")
-emit("cqo")  # sign-extend rax into rdx:rax
+emit("cqo")
 emit(f"mov rbx, {b}")
 emit("idiv rbx")
 #endpython
