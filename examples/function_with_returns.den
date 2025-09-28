@@ -5,3 +5,4 @@ Main() {
     result = Add(40, 2);
     Print: ("Result: " + result);
 }
+
