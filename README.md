@@ -1,6 +1,6 @@
 # Density-2
 
-
+*density2_compiler.py not density2c*
 
 ---
 
@@ -447,7 +447,7 @@ This will include:
 Density2-x64-setup.exe
 ```
 
-* Adds `density2c` to PATH.
+* Adds `density2_compiler.py` to PATH.
 * Installs `density2c.exe` compiler, standard libraries, and examples.
 
 ### Linux (Debian/Ubuntu)
@@ -895,7 +895,7 @@ Density 2 is **AOT-compiled** and does **not** require a runtime environment —
 
 * **Core CLI Tools**:
 
-  * `density2c` → Compiler frontend.
+  * `density2_compiler.py` → Compiler frontend.
   * `density2as` → Assembly injector (for inline ASM).
   * `density2pkg` → Package manager for libraries.
   * `density2doc` → Documentation generator.
