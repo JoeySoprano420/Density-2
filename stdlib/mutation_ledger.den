@@ -1,0 +1,11 @@
+'''LogMutation(id, node)
+#python
+emit(f"; Mutation {id}: {node}")
+#endpython
+,,,
+
+'''ReplayMutation(id)
+#python
+emit(f"; Replaying mutation {id}")
+#endpython
+,,,
