@@ -1,0 +1,8 @@
+'''Repeat(msg, n)
+for (i = 0; i < n; i++)
+    Print: (msg);
+,,,
+
+Main() {
+    Repeat("Echo!", 3);
+}
