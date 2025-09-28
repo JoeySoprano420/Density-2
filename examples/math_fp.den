@@ -1,0 +1,20 @@
+'''Sqrt(x)
+#c
+#include <math.h>
+double result = sqrt((double) x);
+#endc
+,,,
+
+'''Sin(x)
+#c
+#include <math.h>
+double result = sin((double) x);
+#endc
+,,,
+
+'''Cos(x)
+#c
+#include <math.h>
+double result = cos((double) x);
+#endc
+,,,
