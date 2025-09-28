@@ -1,0 +1,7 @@
+Func Add(a, b)
+    return a + b;
+
+Main() {
+    result = Add(40, 2);
+    Print: ("Result: " + result);
+}
