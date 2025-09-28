@@ -1538,4 +1538,667 @@ emit("mov rdi, 1")
 
     # End of density2_compiler.py
 
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import hashlib
+from typing import List, Tuple, Union, Dict, Optional
 
+# -----------------------------
+# Token Definitions
+# -----------------------------
+TOKEN_SPECIFICATION = [
+    # Blocks first (non-greedy to avoid overconsumption)
+    ('CIAM',        r"'''(.*?),,,"),              # ''' ... ,,,
+    ('INLINE_ASM',  r"#asm(.*?)#endasm"),
+    ('INLINE_C',    r"#c(.*?)#endc"),
+    ('INLINE_PY',   r"#python(.*?)#endpython"),
+
+    # Comments
+    ('COMMENT',     r'//[^\n]*'),
+    ('MCOMMENT',    r'/\*.*?\*/'),
+
+    # Literals and identifiers
+    # Unterminated string recovery: BAD_STRING must be before STRING and MISMATCH
+    ('BAD_STRING',  r'"(?:\\.|[^"\\])*?(?=\n|$)'),
+    ('STRING',      r'"(?:\\.|[^"\\])*"'),
+    # Unicode identifier: first char is any Unicode letter (no digit/underscore), then word chars
+    ('IDENT',       r'[^\W\d_][\w]*'),
+
+    # Symbols
+    ('LBRACE',      r'\{'),
+    ('RBRACE',      r'\}'),
+    ('LPAREN',      r'\('),
+    ('RPAREN',      r'\)'),
+    ('COLON',       r':'),
+    ('SEMICOLON',   r';'),
+    ('COMMA',       r','),         # macro args
+    ('PLUS',        r'\+'),        # string concat
+
+    # Whitespace, newline, and mismatch
+    ('NEWLINE',     r'\n'),
+    ('SKIP',        r'[ \t]+'),
+    ('MISMATCH',    r'.'),
+]
+
+# Make CIAM and INLINE_* non-greedy by ensuring (.*?) groups are used above.
+# Note: CIAM pattern above currently uses (.*?),,, via the outer token list string.
+TOKEN_SPECIFICATION = [
+    (name, (pattern if name != 'CIAM' else r"'''(.*?),,,")) for (name, pattern) in TOKEN_SPECIFICATION
+]
+
+token_regex = '|'.join('(?P<%s>%s)' % pair for pair in TOKEN_SPECIFICATION)
+
+# Global token filter hooks and lexer error buffer
+TOKEN_FILTERS: List = []
+_LAST_LEX_ERRORS: List[str] = []
+
+def register_token_filter(fn) -> None:
+    TOKEN_FILTERS.append(fn)
+
+def get_last_lex_errors() -> List[str]:
+    return list(_LAST_LEX_ERRORS)
+
+
+class Token:
+    def __init__(self, type_: str, value: str, line: int, column: int):
+        self.type = type_
+        self.value = value
+        self.line = line
+        self.column = column
+
+    def __repr__(self):
+        return f"Token({self.type}, {self.value!r}, line={self.line}, col={self.column})"
+
+
+# -----------------------------
+# Lexer
+# -----------------------------
+class SyntaxErrorEx(Exception):
+    def __init__(self, message: str, line: int, col: int, suggestion: Optional[str] = None):
+        self.line = line
+        self.col = col
+        self.suggestion = suggestion
+        super().__init__(f"{message} @ {line}:{col}" + (f" | hint: {suggestion}" if suggestion else ""))
+
+def tokenize(code: str) -> List[Token]:
+    # UTF-8 BOM handling: strip BOM if present
+    if code.startswith('\ufeff'):
+        code = code.lstrip('\ufeff')
+
+    tokens: List[Token] = []
+    _LAST_LEX_ERRORS.clear()
+    line_num = 1
+    line_start = 0
+    for mo in re.finditer(token_regex, code, re.DOTALL):
+        kind = mo.lastgroup
+        value = mo.group()
+        column = mo.start() - line_start
+        if kind == 'NEWLINE':
+            line_num += 1
+            line_start = mo.end()
+            continue
+        elif kind in ('SKIP', 'COMMENT', 'MCOMMENT'):
+            continue
+        elif kind == 'BAD_STRING':
+            # Recover: capture as error token and continue to next line
+            msg = f"Unterminated string literal"
+            _LAST_LEX_ERRORS.append(f"{msg} at {line_num}:{column}")
+            tokens.append(Token('ERROR', value, line_num, column))
+            continue
+        elif kind == 'MISMATCH':
+            raise RuntimeError(f'{value!r} unexpected on line {line_num}')
+        tokens.append(Token(kind, value, line_num, column))
+
+    # Apply token filters last
+    for filt in TOKEN_FILTERS:
+        tokens = filt(tokens)
+    return tokens
+
+
+# -----------------------------
+# AST Nodes
+# -----------------------------
+class ASTNode:
+    """
+    Base class for all Density 2 AST nodes.
+
+    Features:
+    - Optional source position tracking: filename, (line, col) -> (end_line, end_col)
+    - Child discovery: children() finds nested AST nodes and lists of nodes
+    - Traversal: walk() yields nodes in preorder
+    - Visitor pattern: accept(visitor) calls visitor.visit_<Type>(self) or visitor.visit(self)
+    - Structural replace: replace_child(old, new) updates direct attributes/lists
+    - Serialization: to_dict()/pretty() for debugging and tooling
+    - Copy: copy(**overrides) for shallow cloning
+    - Dodecagram encoding: to_dodecagram() uses global ast_to_dodecagram if available
+    - Structural equality: __eq__ based on type and serialized content (excluding positions)
+    """
+
+    # Position information is optional and can be set later via set_pos().
+    def __init__(
+        self,
+        *,
+        filename: Optional[str] = None,
+        line: Optional[int] = None,
+        col: Optional[int] = None,
+        end_line: Optional[int] = None,
+        end_col: Optional[int] = None,
+    ):
+        self.filename = filename
+        self.line = line
+        self.col = col
+        self.end_line = end_line
+        self.end_col = end_col
+
+    # ----- Source position helpers -----
+    def set_pos(
+        self,
+        *,
+        filename: Optional[str] = None,
+        line: Optional[int] = None,
+        col: Optional[int] = None,
+        end_line: Optional[int] = None,
+        end_col: Optional[int] = None,
+    ) -> "ASTNode":
+        if filename is not None:
+            self.filename = filename
+        if line is not None:
+            self.line = line
+        if col is not None:
+            self.col = col
+        if end_line is not None:
+            self.end_line = end_line
+        if end_col is not None:
+            self.end_col = end_col
+        return self
+
+    # ----- Introspection helpers -----
+    def _is_pos_field(self, name: str) -> bool:
+        return name in ("filename", "line", "col", "end_line", "end_col")
+
+    def _iter_fields(self):
+        # Do not consider private/dunder attributes as AST data
+        for k, v in self.__dict__.items():
+            if k.startswith("_"):
+                continue
+            yield k, v
+
+    def children(self) -> List["ASTNode"]:
+        """Return direct child AST nodes (flattening lists)."""
+        result: List[ASTNode] = []
+        for _, v in self._iter_fields():
+            if isinstance(v, ASTNode):
+                result.append(v)
+            elif isinstance(v, list):
+                for it in v:
+                    if isinstance(it, ASTNode):
+                        result.append(it)
+        return result
+
+    def walk(self):
+        """Preorder traversal of this subtree."""
+        yield self
+        for c in self.children():
+            yield from c.walk()
+
+    # ----- Visitor pattern -----
+    def accept(self, visitor):
+        """Call visitor.visit_<Type>(self) if present, else visitor.visit(self) if present."""
+        method = getattr(visitor, f"visit_{self.__class__.__name__}", None)
+        if callable(method):
+            return method(self)
+        generic = getattr(visitor, "visit", None)
+        if callable(generic):
+            return generic(self)
+        return None
+
+    # ----- Structural operations -----
+    def replace_child(self, old: "ASTNode", new: Optional["ASTNode"]) -> bool:
+        """
+        Replace a direct child 'old' with 'new'.
+        If 'new' is None, removes the child if it's in a list; clears attribute otherwise.
+        Returns True if a replacement/removal occurred.
+        """
+        changed = False
+        for k, v in list(self._iter_fields()):
+            if isinstance(v, ASTNode):
+                if v is old:
+                    setattr(self, k, new)
+                    changed = True
+            elif isinstance(v, list):
+                # Replace in lists; remove if new is None
+                new_list = []
+                for it in v:
+                    if it is old:
+                        if new is not None:
+                            new_list.append(new)
+                        changed = True
+                    else:
+                        new_list.append(it)
+                if changed:
+                    setattr(self, k, new_list)
+        return changed
+
+    # ----- Serialization / Debugging -----
+    def to_dict(self, *, include_pos: bool = True) -> Dict[str, object]:
+        """Convert the node (recursively) to a dict suitable for JSON/debugging."""
+        d: Dict[str, object] = {"__type__": self.__class__.__name__}
+        for k, v in self._iter_fields():
+            if not include_pos and self._is_pos_field(k):
+                continue
+            if isinstance(v, ASTNode):
+                d[k] = v.to_dict(include_pos=include_pos)
+            elif isinstance(v, list):
+                d[k] = [
+                    (it.to_dict(include_pos=include_pos) if isinstance(it, ASTNode) else it)
+                    for it in v
+                ]
+            else:
+                d[k] = v
+        return d
+
+    def pretty(self, indent: str = "  ") -> str:
+        """Human-readable multi-line tree dump."""
+        lines: List[str] = []
+
+        def rec(n: "ASTNode", depth: int):
+            pad = indent * depth
+            header = n.__class__.__name__
+            pos = []
+            if n.filename:
+                pos.append(f'file="{n.filename}"')
+            if n.line is not None and n.col is not None:
+                pos.append(f"@{n.line}:{n.col}")
+            if n.end_line is not None and n.end_col is not None:
+                pos.append(f"-{n.end_line}:{n.end_col}")
+            if pos:
+                header += " [" + " ".join(pos) + "]"
+            lines.append(pad + header)
+
+            # Show scalar fields
+            for k, v in n._iter_fields():
+                if isinstance(v, ASTNode):
+                    continue
+                if isinstance(v, list) and any(isinstance(it, ASTNode) for it in v):
+                    continue
+                lines.append(pad + indent + f"{k} = {v!r}")
+
+            # Recurse into child nodes
+            for k, v in n._iter_fields():
+                if isinstance(v, ASTNode):
+                    lines.append(pad + indent + f"{k}:")
+                    rec(v, depth + 2)
+                elif isinstance(v, list):
+                    child_nodes = [it for it in v if isinstance(it, ASTNode)]
+                    if child_nodes:
+                        lines.append(pad + indent + f"{k}: [{len(child_nodes)}]")
+                        for it in child_nodes:
+                            rec(it, depth + 2)
+
+        rec(self, 0)
+        return "\n".join(lines)
+
+    def copy(self, **overrides):
+        """
+        Shallow copy with optional field overrides:
+            new = node.copy(body=new_body)
+        """
+        cls = self.__class__
+        new_obj = cls.__new__(cls)  # type: ignore
+        # Copy all instance attributes
+        new_obj.__dict__.update(self.__dict__)
+        # Apply overrides
+        for k, v in overrides.items():
+            setattr(new_obj, k, v)
+        return new_obj
+
+    def to_dodecagram(self) -> str:
+        """
+        Encode this node (and subtree) using the Dodecagram mapping.
+        Relies on a global function ast_to_dodecagram(node).
+        """
+        f = globals().get("ast_to_dodecagram")
+        if callable(f):
+            return f(self)  # type: ignore[misc]
+        raise RuntimeError("ast_to_dodecagram() is not available in this module")
+
+    # ----- Equality / Representation -----
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ASTNode):
+            return False
+        if self.__class__ is not other.__class__:
+            return False
+        return self.to_dict(include_pos=False) == other.to_dict(include_pos=False)
+
+    def __repr__(self) -> str:
+        # Compact representation showing scalar fields only
+        fields: List[str] = []
+        for k, v in self._iter_fields():
+            if isinstance(v, ASTNode):
+                continue
+            if isinstance(v, list) and any(isinstance(it, ASTNode) for it in v):
+                continue
+            fields.append(f"{k}={v!r}")
+        inner = ", ".join(fields)
+        return f"{self.__class__.__name__}({inner})"
+
+
+class Program(ASTNode):
+    def __init__(self, functions: List['Function']):
+        self.functions = functions
+
+    def __repr__(self):
+        return f"Program({self.functions})"
+
+
+class Function(ASTNode):
+    def __init__(self, name: str, body: List['Statement']):
+        self.name = name
+        self.body = body
+
+    def __repr__(self):
+        return f"Function({self.name}, body={self.body})"
+
+
+class Statement(ASTNode):
+    """Base class for all statements in Density 2."""
+    pass
+
+
+class PrintStatement(Statement):
+    def __init__(self, text: str):
+        self.text = text
+
+    def __repr__(self):
+        return f"Print({self.text!r})"
+
+
+class CIAMBlock(Statement):
+    def __init__(self, name: str, params: List[str], body_text: str):
+        self.name = name
+        self.params = params
+        self.body_text = body_text  # raw Density 2 snippet
+
+    def __repr__(self):
+        return f"CIAMBlock(name={self.name!r}, params={self.params}, body_len={len(self.body_text)})"
+
+
+class MacroCall(Statement):
+    def __init__(self, name: str, arg_texts: List[str]):
+        self.name = name
+        self.arg_texts = arg_texts  # raw argument texts
+
+    def __repr__(self):
+        return f"MacroCall({self.name!r}, args={self.arg_texts})"
+
+
+class InlineBlock(Statement):
+    def __init__(self, lang: str, content: str):
+        self.lang = lang  # 'asm', 'c', 'python'
+        self.content = content
+
+    def __repr__(self):
+        return f"InlineBlock(lang={self.lang!r}, content_len={len(self.content)})"
+
+
+# -----------------------------
+# Dodecagram AST encoding
+# -----------------------------
+_DODECAGRAM_MAP = {
+    'Program': '0',
+    'Function': '1',
+    'PrintStatement': '2',
+    'CIAMBlock': '3',
+    'MacroCall': '4',
+    # InlineBlock variants:
+    'InlineBlock:asm': '5',
+    'InlineBlock:python': '6',
+    'InlineBlock:py': '6',
+    'InlineBlock:c': '7',
+    'InlineBlock:other': '8',
+    # Reserved for future nodes:
+    '_reserved9': '9',
+    '_reserveda': 'a',
+    '_reservedb': 'b',
+}
+
+def ast_to_dodecagram(node: ASTNode) -> str:
+    """
+    Preorder encoding of the AST using the Dodecagram alphabet 0-9,a,b.
+    """
+    def enc(n: ASTNode) -> str:
+        if isinstance(n, Program):
+            s = _DODECAGRAM_MAP['Program']
+            for f in n.functions:
+                s += enc(f)
+            return s
+        if isinstance(n, Function):
+            s = _DODECAGRAM_MAP['Function']
+            for st in n.body:
+                s += enc(st)
+            return s
+        if isinstance(n, PrintStatement):
+            return _DODECAGRAM_MAP['PrintStatement']
+        if isinstance(n, CIAMBlock):
+            return _DODECAGRAM_MAP['CIAMBlock']
+        if isinstance(n, MacroCall):
+            return _DODECAGRAM_MAP['MacroCall']
+        if isinstance(n, InlineBlock):
+            key = f'InlineBlock:{n.lang}'
+            ch = _DODECAGRAM_MAP.get(key, _DODECAGRAM_MAP['InlineBlock:other'])
+            return ch
+        # Unknown node -> reserved
+        return _DODECAGRAM_MAP['_reserved9']
+    return enc(node)
+
+# -----------------------------
+# Parser
+# -----------------------------
+class Parser:
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens
+        self.pos = 0
+        # Macro table collected while parsing: name -> CIAMBlock
+        self.macro_table: Dict[str, CIAMBlock] = {}
+
+    def _error(self, expected: str, got: Optional[Token], suggestion: Optional[str] = None):
+        if got:
+            raise SyntaxErrorEx(f"Expected {expected}, got {got.type} {got.value!r}", got.line, got.column, suggestion)
+        raise SyntaxErrorEx(f"Expected {expected}, got <eof>", -1, -1, suggestion)
+
+    def peek(self) -> Optional[Token]:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def lookahead(self, offset: int) -> Optional[Token]:
+        idx = self.pos + offset
+        if 0 <= idx < len(self.tokens):
+            return self.tokens[idx]
+        return None
+
+    def consume(self, expected_type: str) -> Token:
+        tok = self.peek()
+        if not tok or tok.type != expected_type:
+            self._error(expected_type, tok, suggestion="Check syntax near here; try adding missing delimiter or semicolon")
+        self.pos += 1
+        return tok
+
+    def match(self, expected_type: str) -> bool:
+        tok = self.peek()
+        if tok and tok.type == expected_type:
+            self.pos += 1
+            return True
+        return False
+
+    def parse(self) -> Program:
+        functions: List[Function] = []
+        while self.peek() is not None:
+            # Expect IDENT (function name) or skip stray tokens
+            tok = self.peek()
+            if tok.type == 'IDENT':
+                # Look for function signature IDENT()
+                if self.lookahead(1) and self.lookahead(1).type == 'LPAREN':
+                    functions.append(self.parse_function())
+                else:
+                    # Skip stray identifier
+                    self.pos += 1
+            else:
+                # Skip unknown tokens at top-level
+                self.pos += 1
+        return Program(functions)
+
+    def parse_function(self) -> Function:
+        name_tok = self.consume('IDENT')
+        self.consume('LPAREN')
+        self.consume('RPAREN')
+        body: List[Statement] = []
+        if self.match('LBRACE'):
+            # Block body
+            body = self.parse_statements_until_rbrace()
+            self.consume('RBRACE')
+        else:
+            # Single statement allowed
+            stmt = self.parse_statement()
+            if stmt:
+                body.append(stmt)
+        return Function(name_tok.value, body)
+
+    def parse_statements_until_rbrace(self) -> List[Statement]:
+        stmts: List[Statement] = []
+        while True:
+            tok = self.peek()
+            if tok is None or tok.type == 'RBRACE':
+                break
+            stmt = self.parse_statement()
+            if stmt:
+                if isinstance(stmt, list):
+                    stmts.extend(stmt)
+                else:
+                    stmts.append(stmt)
+        return stmts
+
+    def parse_statement(self) -> Optional[Union[Statement, List[Statement]]]:
+        tok = self.peek()
+        if tok is None:
+            return None
+
+        if tok.type == 'IDENT' and tok.value == 'Print':
+            return self.parse_print()
+
+        if tok.type == 'CIAM':
+            # Parse CIAM block definition, store in macro table, no direct output
+            ciam_tok = self.consume('CIAM')
+            content = ciam_tok.value
+            # Strip delimiters: starts with ''' and ends with ,,,
+            if content.startswith("'''"):
+                content_inner = content[3:]
+                if content_inner.endswith(",,,"):
+                    content_inner = content_inner[:-3]
+            else:
+                content_inner = content
+
+            name, params, body_text = self._parse_ciam_content(content_inner.strip(), ciam_tok)
+            ciam_block = CIAMBlock(name, params, body_text)
+            self.macro_table[name] = ciam_block
+            # Defining a macro does not emit code
+            return None
+
+        if tok.type.startswith('INLINE_'):
+            return self.parse_inline_block()
+
+        if tok.type == 'IDENT':
+            # Possibly a macro invocation: IDENT(...)
+            ident = tok.value
+            la = self.lookahead(1)
+            if la and la.type == 'LPAREN':
+                return self.parse_macro_call()
+            else:
+                # Unknown ident; consume to progress
+                self.pos += 1
+                return None
+
+        # Unknown token; consume to progress
+        self.pos += 1
+        return None
+
+    def _parse_ciam_content(self, content: str, tok: Token) -> Tuple[str, List[str], str]:
+        # First line: Name(params)
+        lines = content.splitlines()
+        if not lines:
+            raise SyntaxError(f"Empty CIAM at line {tok.line}")
+
+        header = lines[0].strip()
+        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*$', header)
+        if not m:
+            raise SyntaxError(f"Invalid CIAM header '{header}' at line {tok.line}")
+        name = m.group(1)
+        params_str = m.group(2).strip()
+        params = []
+        if params_str:
+            params = [p.strip() for p in params_str.split(',') if p.strip()]
+        body_text = '\n'.join(lines[1:]).strip()
+        return name, params, body_text
+
+    def parse_macro_call(self) -> MacroCall:
+        name_tok = self.consume('IDENT')
+        self.consume('LPAREN')
+        args: List[str] = []
+        current_parts: List[str] = []
+        paren_depth = 1
+        while True:
+            tok = self.peek()
+            if tok is None:
+                raise SyntaxError("Unclosed macro call")
+            if tok.type == 'LPAREN':
+                paren_depth += 1
+                current_parts.append(tok.value)
+                self.pos += 1
+            elif tok.type == 'RPAREN':
+                paren_depth -= 1
+                if paren_depth == 0:
+                    # finalize last arg
+                    arg_text = ''.join(current_parts).strip()
+                    if arg_text:
+                        args.append(arg_text)
+                    self.pos += 1
+                    break
+                else:
+                    current_parts.append(tok.value)
+                    self.pos += 1
+            elif tok.type == 'COMMA' and paren_depth == 1:
+                arg_text = ''.join(current_parts).strip()
+                args.append(arg_text)
+                current_parts = []
+                self.pos += 1
+            else:
+                current_parts.append(tok.value)
+                self.pos += 1
+        self.consume('SEMICOLON')
+        return MacroCall(name_tok.value, args)
+
+    def parse_inline_block(self) -> InlineBlock:
+        tok = self.peek()
+        lang = tok.type.split('_', 1)[1].lower()  # asm / c / py
+        inline_tok = self.consume(tok.type)
+        # strip off #lang and #endlang markers:
+        content = re.sub(r'^#\w+', '', inline_tok.value, flags=re.DOTALL)
+        content = re.sub(r'#end\w+$', '', content, flags=re.DOTALL)
+        return InlineBlock(lang, content.strip())
+
+    def parse_print(self) -> PrintStatement:
+        self.consume('IDENT')  # 'Print'
+        self.consume('COLON')
+        self.consume('LPAREN')
+
+        # Simple string concat of STRING (+ STRING)*
+        parts: List[str] = []
+        first = True
+        while True:
+            tok = self.peek()
+            if not tok:
+                raise SyntaxError("Unclosed Print: missing ')'")
