@@ -3256,7 +3256,7 @@ def parse_density2(code: str) -> Program:
 def main():
     if len(sys.argv) < 2:
         print("Usage: density2_compiler.py <input.den2> [--debug]")
-        sys.exit(2)
+        sys.exit(0)
 
     debug_mode = '--debug' in sys.argv
     src_path = next((a for a in sys.argv[1:] if not a.startswith('--')), None)
@@ -3772,3 +3772,799 @@ def start_debugger(ast_or_source: Any, filename: Optional[str] = None) -> None:
     sess = DebugSession(ast_or_source, filename=filename)
     sess.repl()
 
+# 1) REPLACE the TOKEN_SPECIFICATION block with this extended ruleset (operators first for longest-match)
+
+TOKEN_SPECIFICATION = [
+    # Blocks (non-greedy)
+    ('CIAM',        r"'''(.*?),,,"),                 # ''' ... ,,,
+    ('INLINE_ASM',  r"#asm(.*?)#endasm"),
+    ('INLINE_C',    r"#c(.*?)#endc"),
+    ('INLINE_PY',   r"#python(.*?)#endpython"),
+
+    # Comments/whitespace
+    ('COMMENT',     r'//[^\n]*'),
+    ('MCOMMENT',    r'/\*.*?\*/'),
+    ('NEWLINE',     r'\n'),
+    ('SKIP',        r'[ \t]+'),
+
+    # Operators and punctuation (longest first)
+    ('EQEQ',        r'=='),
+    ('NEQ',        r'!='),
+    ('LTE',        r'<='),
+    ('GTE',        r'>='),
+    ('ANDAND',     r'&&'),
+    ('OROR',       r'\|\|'),
+    ('ASSIGN',     r'='),
+    ('LT',         r'<'),
+    ('GT',         r'>'),
+    ('PLUS',       r'\+'),
+    ('MINUS',      r'-'),
+    ('STAR',       r'\*'),
+    ('SLASH',      r'/'),
+    ('PERCENT',    r'%'),
+    ('BANG',       r'!'),
+    ('LBRACE',     r'\{'),
+    ('RBRACE',     r'\}'),
+    ('LPAREN',     r'\('),
+    ('RPAREN',     r'\)'),
+    ('COLON',      r':'),
+    ('SEMICOLON',  r';'),
+    ('COMMA',      r','),
+
+    # Literals and identifiers
+    ('INT',        r'0|[1-9][0-9]*'),
+    ('STRING',     r'"(?:\\.|[^"\\])*"'),
+    ('IDENT',      r'[A-Za-z_][A-Za-z0-9_]*'),
+
+    # Mismatch
+    ('MISMATCH',   r'.'),
+]
+
+# Ensure CIAM non-greedy is kept
+TOKEN_SPECIFICATION = [
+    (name, (pattern if name != 'CIAM' else r"'''(.*?),,,")) for (name, pattern) in TOKEN_SPECIFICATION
+]
+
+token_regex = '|'.join('(?P<%s>%s)' % pair for pair in TOKEN_SPECIFICATION)
+
+# Precompile for speed
+_TOKEN_RE = re.compile(token_regex, re.DOTALL)
+
+# 2) REPLACE tokenize() with stronger errors and the precompiled regex (keeps BOM stripping optional)
+
+class SyntaxErrorEx(Exception):
+    def __init__(self, message: str, line: int, col: int, hint: Optional[str] = None):
+        self.line = line
+        self.col = col
+        self.hint = hint
+        full = f"{message} @ {line}:{col}"
+        if hint:
+            full += f" | hint: {hint}"
+        super().__init__(full)
+
+def tokenize(code: str) -> List[Token]:
+    tokens: List[Token] = []
+    line_num = 1
+    line_start = 0
+    for mo in _TOKEN_RE.finditer(code):
+        kind = mo.lastgroup
+        value = mo.group()
+        column = mo.start() - line_start
+
+        if kind == 'NEWLINE':
+            line_num += 1
+            line_start = mo.end()
+            continue
+        if kind in ('SKIP', 'COMMENT', 'MCOMMENT'):
+            continue
+        if kind == 'MISMATCH':
+            raise SyntaxErrorEx(f"Unexpected character {value!r}", line_num, column, hint="Remove or escape the character")
+        tokens.append(Token(kind, value, line_num, column))
+    return tokens
+
+# 3) ADD new AST nodes (place after existing AST node classes and before Parser)
+
+# --- Types, Expressions, and new Statements ---
+
+class TypeName(ASTNode):
+    def __init__(self, name: str):
+        self.name = name
+    def __repr__(self): return f"TypeName({self.name!r})"
+
+class Literal(ASTNode):
+    def __init__(self, value: Union[int, str, bool]):
+        self.value = value
+    def __repr__(self): return f"Literal({self.value!r})"
+
+class VarRef(ASTNode):
+    def __init__(self, name: str):
+        self.name = name
+    def __repr__(self): return f"VarRef({self.name!r})"
+
+class UnaryOp(ASTNode):
+    def __init__(self, op: str, expr: ASTNode):
+        self.op = op
+        self.expr = expr
+    def __repr__(self): return f"UnaryOp({self.op!r}, {self.expr!r})"
+
+class BinaryOp(ASTNode):
+    def __init__(self, op: str, left: ASTNode, right: ASTNode):
+        self.op = op
+        self.left = left
+        self.right = right
+    def __repr__(self): return f"BinaryOp({self.op!r}, {self.left!r}, {self.right!r})"
+
+class VariableDecl(Statement):
+    def __init__(self, name: str, type_name: Optional[TypeName], init: Optional[ASTNode], is_const: bool):
+        self.name = name
+        self.type_name = type_name
+        self.init = init
+        self.is_const = is_const
+    def __repr__(self): return f"VariableDecl({self.name!r}, type={self.type_name!r}, init={self.init!r}, const={self.is_const})"
+
+class Assign(Statement):
+    def __init__(self, name: str, expr: ASTNode):
+        self.name = name
+        self.expr = expr
+    def __repr__(self): return f"Assign({self.name!r}, {self.expr!r})"
+
+class IfStatement(Statement):
+    def __init__(self, cond: ASTNode, then_body: List[Statement], else_body: Optional[List[Statement]]):
+        self.cond = cond
+        self.then_body = then_body
+        self.else_body = else_body or []
+    def __repr__(self): return f"If({self.cond!r}, then={len(self.then_body)}, else={len(self.else_body)})"
+
+class WhileStatement(Statement):
+    def __init__(self, cond: ASTNode, body: List[Statement]):
+        self.cond = cond
+        self.body = body
+    def __repr__(self): return f"While({self.cond!r}, body={len(self.body)})"
+
+class ForStatement(Statement):
+    def __init__(self, init: Optional[Statement], cond: Optional[ASTNode], post: Optional[Statement], body: List[Statement]):
+        self.init = init
+        self.cond = cond
+        self.post = post
+        self.body = body
+    def __repr__(self): return f"For(init={self.init!r}, cond={self.cond!r}, post={self.post!r}, body={len(self.body)})"
+
+class ReturnStatement(Statement):
+    def __init__(self, value: Optional[ASTNode]):
+        self.value = value
+    def __repr__(self): return f"Return({self.value!r})"
+
+class ExprStatement(Statement):
+    def __init__(self, expr: ASTNode):
+        self.expr = expr
+    def __repr__(self): return f"ExprStmt({self.expr!r})"
+
+# 4) EXTEND Parser with expressions, variables, and control flow.
+#    Add these methods into the Parser class.
+
+    # ----- Error helpers -----
+    def _err(self, msg: str, hint: Optional[str] = None):
+        tok = self.peek()
+        if tok:
+            raise SyntaxErrorEx(msg, tok.line, tok.column, hint)
+        raise SyntaxErrorEx(msg, -1, -1, hint)
+
+    def _consume_value(self, expected_type: str) -> Token:
+        tok = self.peek()
+        if not tok or tok.type != expected_type:
+            self._err(f"Expected {expected_type}, got {tok.type if tok else '<eof>'}",
+                      hint="Check delimiters and statement terminators ';'")
+        self.pos += 1
+        return tok
+
+    def _match(self, t: str) -> Optional[Token]:
+        tok = self.peek()
+        if tok and tok.type == t:
+            self.pos += 1
+            return tok
+        return None
+
+    # ----- Blocks -----
+    def parse_block(self) -> List[Statement]:
+        body: List[Statement] = []
+        self._consume_value('LBRACE')
+        while True:
+            tok = self.peek()
+            if tok is None:
+                self._err("Unclosed block", hint="Add '}'")
+            if tok.type == 'RBRACE':
+                self.pos += 1
+                break
+            st = self.parse_statement()
+            if st:
+                if isinstance(st, list):
+                    body.extend(st)
+                else:
+                    body.append(st)
+        return body
+
+    # ----- Statement dispatch -----
+    def parse_statement(self) -> Optional[Union[Statement, List[Statement]]]:
+        tok = self.peek()
+        if tok is None:
+            return None
+
+        # Built-in Print
+        if tok.type == 'IDENT' and tok.value == 'Print':
+            return self.parse_print()
+
+        # CIAM definition
+        if tok.type == 'CIAM':
+            ciam_tok = self.consume('CIAM')
+            content = ciam_tok.value
+            content_inner = content[3:-3] if content.startswith("'''") and content.endswith(",,,") else content
+            name, params, body_text = self._parse_ciam_content(content_inner.strip(), ciam_tok)
+            self.macro_table[name] = CIAMBlock(name, params, body_text)
+            return None
+
+        # Inline blocks
+        if tok.type.startswith('INLINE_'):
+            return self.parse_inline_block()
+
+        # Control flow + declarations
+        if tok.type == 'IDENT':
+            kw = tok.value
+            if kw == 'If':
+                return self.parse_if()
+            if kw == 'While':
+                return self.parse_while()
+            if kw == 'For':
+                return self.parse_for()
+            if kw in ('Let', 'Const'):
+                return self.parse_vardecl(is_const=(kw == 'Const'))
+            if kw == 'Return':
+                return self.parse_return()
+
+            # Macro invocation: IDENT '(' ... ');'
+            la = self.lookahead(1)
+            if la and la.type == 'LPAREN':
+                # keep existing macro call format
+                return self.parse_macro_call()
+
+        # Expression or assignment statement
+        expr = self.parse_expression()
+        self._consume_value('SEMICOLON')
+        # Promote IDENT '=' expr to Assign when left is VarRef and ASSIGN seen (handled in expression parsing)
+        if isinstance(expr, Assign):
+            return expr
+        return ExprStatement(expr)
+
+    # ----- Declarations -----
+    def parse_vardecl(self, is_const: bool) -> VariableDecl:
+        self._consume_value('IDENT')  # 'Let' or 'Const'
+        name_tok = self._consume_value('IDENT')
+        type_name: Optional[TypeName] = None
+        init_expr: Optional[ASTNode] = None
+
+        if self._match('COLON'):
+            type_tok = self._consume_value('IDENT')
+            type_name = TypeName(type_tok.value)
+
+        if self._match('ASSIGN'):
+            init_expr = self.parse_expression()
+
+        self._consume_value('SEMICOLON')
+        return VariableDecl(name_tok.value, type_name, init_expr, is_const)
+
+    # ----- Control flow -----
+    def parse_if(self) -> IfStatement:
+        self._consume_value('IDENT')  # 'If'
+        self._consume_value('LPAREN')
+        cond = self.parse_expression()
+        self._consume_value('RPAREN')
+        then_body = self.parse_block()
+        else_body: Optional[List[Statement]] = None
+        tok = self.peek()
+        if tok and tok.type == 'IDENT' and tok.value == 'Else':
+            self.pos += 1
+            else_body = self.parse_block()
+        return IfStatement(cond, then_body, else_body)
+
+    def parse_while(self) -> WhileStatement:
+        self._consume_value('IDENT')  # 'While'
+        self._consume_value('LPAREN')
+        cond = self.parse_expression()
+        self._consume_value('RPAREN')
+        body = self.parse_block()
+        return WhileStatement(cond, body)
+
+    def parse_for(self) -> ForStatement:
+        self._consume_value('IDENT')  # 'For'
+        self._consume_value('LPAREN')
+        # init; cond; post
+        init_stmt: Optional[Statement] = None
+        if not self._match('SEMICOLON'):
+            # reuse decl or assignment/expr
+            if self.peek().type == 'IDENT' and self.peek().value in ('Let', 'Const'):
+                init_stmt = self.parse_vardecl(is_const=(self.peek().value == 'Const'))  # parse_vardecl consumes ';'
+            else:
+                init_expr = self.parse_expression()
+                self._consume_value('SEMICOLON')
+                init_stmt = ExprStatement(init_expr)
+
+        cond_expr: Optional[ASTNode] = None
+        if not self._match('SEMICOLON'):
+            cond_expr = self.parse_expression()
+            self._consume_value('SEMICOLON')
+
+        post_stmt: Optional[Statement] = None
+        if not self._match('RPAREN'):
+            post_expr = self.parse_expression()
+            self._consume_value('RPAREN')
+            post_stmt = ExprStatement(post_expr)
+
+        body = self.parse_block()
+        return ForStatement(init_stmt, cond_expr, post_stmt, body)
+
+    def parse_return(self) -> ReturnStatement:
+        self._consume_value('IDENT')  # 'Return'
+        # Optional expression
+        if self.peek() and self.peek().type not in ('SEMICOLON',):
+            val = self.parse_expression()
+        else:
+            val = None
+        self._consume_value('SEMICOLON')
+        return ReturnStatement(val)
+
+    # ----- Expressions -----
+    # Pratt parser with precedence
+    def parse_expression(self) -> ASTNode:
+        lhs = self._parse_unary()
+        return self._parse_binops_rhs(0, lhs)
+
+    def _parse_unary(self) -> ASTNode:
+        tok = self.peek()
+        if tok and tok.type in ('PLUS', 'MINUS', 'BANG'):
+            self.pos += 1
+            expr = self._parse_unary()
+            return UnaryOp(tok.type, expr)
+        return self._parse_primary()
+
+    def _parse_primary(self) -> ASTNode:
+        tok = self.peek()
+        if not tok:
+            self._err("Expression expected", hint="Insert literal, variable, or '('expr')'")
+
+        if tok.type == 'LPAREN':
+            self.pos += 1
+            inner = self.parse_expression()
+            self._consume_value('RPAREN')
+            return inner
+
+        if tok.type == 'STRING':
+            self.pos += 1
+            return Literal(eval(tok.value))
+
+        if tok.type == 'INT':
+            self.pos += 1
+            return Literal(int(tok.value))
+
+        if tok.type == 'IDENT':
+            # keywords true/false
+            if tok.value in ('true', 'True'):
+                self.pos += 1
+                return Literal(True)
+            if tok.value in ('false', 'False'):
+                self.pos += 1
+                return Literal(False)
+            # identifier
+            self.pos += 1
+            ident = tok.value
+            # assignment lookahead: IDENT '=' expr
+            if self.peek() and self.peek().type == 'ASSIGN':
+                # parse assignment as a statement-like node but return as expression for uniform handling
+                self.pos += 1  # '='
+                rhs = self.parse_expression()
+                return Assign(ident, rhs)
+            return VarRef(ident)
+
+        self._err(f"Unexpected token in expression: {tok.type} {tok.value!r}",
+                  hint="Use literals, identifiers, or parenthesized expressions")
+
+    # Precedence and associativity
+    _PREC: Dict[str, Tuple[int, str]] = {
+        'OROR': (1, 'L'),   # ||
+        'ANDAND': (2, 'L'), # &&
+        'EQEQ': (3, 'L'), 'NEQ': (3, 'L'),
+        'LT': (4, 'L'), 'LTE': (4, 'L'), 'GT': (4, 'L'), 'GTE': (4, 'L'),
+        'PLUS': (5, 'L'), 'MINUS': (5, 'L'),
+        'STAR': (6, 'L'), 'SLASH': (6, 'L'), 'PERCENT': (6, 'L'),
+    }
+
+    def _parse_binops_rhs(self, expr_prec: int, lhs: ASTNode) -> ASTNode:
+        while True:
+            tok = self.peek()
+            if not tok or tok.type not in self._PREC:
+                return lhs
+            prec, assoc = self._PREC[tok.type]
+            if prec < expr_prec:
+                return lhs
+            self.pos += 1  # consume operator
+            rhs = self._parse_unary()
+            next_tok = self.peek()
+            while next_tok and next_tok.type in self._PREC:
+                next_prec, _ = self._PREC[next_tok.type]
+                if (next_prec > prec) or (next_prec == prec and assoc == 'R'):
+                    rhs = self._parse_binops_rhs(prec + 1, rhs)
+                    break
+                else:
+                    break
+            lhs = BinaryOp(tok.type, lhs, rhs)
+        # unreachable
+
+# 5) EXTEND CodeGenerator with variables/expressions/control flow and better Inline C normalization.
+
+class CodeGenerator:
+    def __init__(self, ast: Program):
+        self.ast = ast
+        self.text_lines: List[str] = []
+        self.data_lines: List[str] = []
+        self.bss_lines: List[str] = []
+        self.string_table: Dict[str, str] = {}
+        self.label_counter = 0
+        self._reg_cache = {'rax_sys_write': False, 'rdi_stdout': False}
+        self._locals: Dict[str, Dict[str, str]] = {}  # funcName -> {varName -> label}
+
+    def generate(self) -> str:
+        self.text_lines = []
+        self.data_lines = []
+        self.bss_lines = []
+        self.string_table.clear()
+        self.label_counter = 0
+        self._invalidate_reg_cache()
+
+        self._emit_header()
+        # collect locals and emit bss
+        for func in self.ast.functions:
+            self._collect_locals(func)
+        if self.bss_lines:
+            self.text_lines.append('; [bss emitted at top of file]')
+
+        for func in self.ast.functions:
+            self._emit_function(func)
+
+        out: List[str] = []
+        if self.bss_lines:
+            out.append('section .bss')
+            out.extend('    ' + l for l in self.bss_lines)
+        out.append('section .data')
+        out.extend('    ' + l for l in self.data_lines)
+        out.append('section .text')
+        out.append('    global _start')
+        out.extend(self.text_lines)
+        return '\n'.join(out)
+
+    def _collect_locals(self, func: Function):
+        table: Dict[str, str] = {}
+        def collect_stmt(st: Statement):
+            if isinstance(st, VariableDecl):
+                lbl = f'{func.name}_var_{st.name}'
+                if st.name not in table:
+                    table[st.name] = lbl
+                    self.bss_lines.append(f'{lbl}    dq 0')
+            elif isinstance(st, IfStatement):
+                for s in st.then_body: collect_stmt(s)
+                for s in st.else_body: collect_stmt(s)
+            elif isinstance(st, WhileStatement):
+                for s in st.body: collect_stmt(s)
+            elif isinstance(st, ForStatement):
+                if st.init: collect_stmt(st.init)
+                for s in st.body: collect_stmt(s)
+            # others: no local declarations
+        for s in func.body:
+            collect_stmt(s)
+        self._locals[func.name] = table
+
+    def _emit_function(self, func: Function):
+        end_label = self._new_label(f'{func.name}_end')
+        if func.name == 'Main':
+            self.text_lines.append('_start:')
+        else:
+            self.text_lines.append(f'{func.name}:')
+        self._invalidate_reg_cache()
+
+        # initialize declared variables with init values
+        for st in func.body:
+            if isinstance(st, VariableDecl) and st.init is not None:
+                self._emit_expr(func, st.init)      # rax = value
+                var_label = self._locals[func.name][st.name]
+                self.text_lines.append(f'    mov [{var_label}], rax')
+
+        for st in func.body:
+            self._emit_stmt(func, st, end_label)
+
+        if func.name == 'Main':
+            self._emit_exit()
+        self.text_lines.append(f'{end_label}:')
+
+    def _emit_stmt(self, func: Function, st: Statement, end_label: str):
+        if isinstance(st, PrintStatement):
+            self._emit_print(st.text)
+            return
+        if isinstance(st, InlineBlock):
+            self._emit_inline(st)
+            self._invalidate_reg_cache()
+            return
+        if isinstance(st, VariableDecl):
+            # init handled at function entry
+            return
+        if isinstance(st, Assign):
+            self._emit_expr(func, st.expr)
+            var_label = self._locals[func.name].get(st.name)
+            if var_label is None:
+                var_label = self._declare_implicit(func, st.name)
+            self.text_lines.append(f'    mov [{var_label}], rax')
+            return
+        if isinstance(st, ExprStatement):
+            self._emit_expr(func, st.expr)  # result in rax, ignored
+            return
+        if isinstance(st, IfStatement):
+            else_lbl = self._new_label('else')
+            end_if = self._new_label('endif')
+            self._emit_expr(func, st.cond)
+            self.text_lines.append('    cmp rax, 0')
+            self.text_lines.append(f'    je {else_lbl}')
+            for ss in st.then_body:
+                self._emit_stmt(func, ss, end_label)
+            self.text_lines.append(f'    jmp {end_if}')
+            self.text_lines.append(f'{else_lbl}:')
+            for ss in st.else_body:
+                self._emit_stmt(func, ss, end_label)
+            self.text_lines.append(f'{end_if}:')
+            return
+        if isinstance(st, WhileStatement):
+            top = self._new_label('while_top')
+            done = self._new_label('while_end')
+            self.text_lines.append(f'{top}:')
+            self._emit_expr(func, st.cond)
+            self.text_lines.append('    cmp rax, 0')
+            self.text_lines.append(f'    je {done}')
+            for ss in st.body:
+                self._emit_stmt(func, ss, end_label)
+            self.text_lines.append(f'    jmp {top}')
+            self.text_lines.append(f'{done}:')
+            return
+        if isinstance(st, ForStatement):
+            top = self._new_label('for_top')
+            done = self._new_label('for_end')
+            if st.init:
+                self._emit_stmt(func, st.init, end_label)
+            self.text_lines.append(f'{top}:')
+            if st.cond:
+                self._emit_expr(func, st.cond)
+                self.text_lines.append('    cmp rax, 0')
+                self.text_lines.append(f'    je {done}')
+            for ss in st.body:
+                self._emit_stmt(func, ss, end_label)
+            if st.post:
+                self._emit_stmt(func, st.post, end_label)
+            self.text_lines.append(f'    jmp {top}')
+            self.text_lines.append(f'{done}:')
+            return
+        if isinstance(st, ReturnStatement):
+            # For Main, return exits with code; for others, just jump to end
+            if st.value is not None:
+                self._emit_expr(func, st.value)
+            else:
+                self.text_lines.append('    xor rax, rax')
+            if func.name == 'Main':
+                # rax holds value; move to rdi and exit at end_label
+                self.text_lines.append('    mov rdi, rax')
+            self.text_lines.append(f'    jmp {end_label}')
+            return
+        if isinstance(st, CIAMBlock) or isinstance(st, MacroCall):
+            self.text_lines.append('    ; macro artifacts should be expanded away')
+            return
+        self.text_lines.append('    ; Unknown statement')
+
+    def _emit_expr(self, func: Function, e: ASTNode):
+        if isinstance(e, Literal):
+            if isinstance(e.value, bool):
+                self.text_lines.append(f'    mov rax, {1 if e.value else 0}')
+            elif isinstance(e.value, int):
+                self.text_lines.append(f'    mov rax, {e.value}')
+            elif isinstance(e.value, str):
+                # materialize string address: put into .data and move address to rax (not printed)
+                lbl, _ = self._get_string_label(e.value)
+                self.text_lines.append(f'    lea rax, [{lbl}]')
+            return
+        if isinstance(e, VarRef):
+            var_label = self._locals[func.name].get(e.name)
+            if var_label is None:
+                var_label = self._declare_implicit(func, e.name)
+            self.text_lines.append(f'    mov rax, [{var_label}]')
+            return
+        if isinstance(e, Assign):
+            self._emit_expr(func, e.expr)
+            var_label = self._locals[func.name].get(e.name)
+            if var_label is None:
+                var_label = self._declare_implicit(func, e.name)
+            self.text_lines.append(f'    mov [{var_label}], rax')
+            return
+        if isinstance(e, UnaryOp):
+            self._emit_expr(func, e.expr)
+            if e.op == 'MINUS':
+                self.text_lines.append('    neg rax')
+            elif e.op == 'BANG':
+                # logical not: rax = (rax == 0) ? 1 : 0
+                self.text_lines.append('    cmp rax, 0')
+                self.text_lines.append('    mov rax, 0')
+                self.text_lines.append('    sete al')
+            return
+        if isinstance(e, BinaryOp):
+            # Evaluate left, push; evaluate right, compute with rbx
+            self._emit_expr(func, e.left)
+            self.text_lines.append('    push rax')
+            self._emit_expr(func, e.right)
+            self.text_lines.append('    mov rbx, rax')
+            self.text_lines.append('    pop rax')
+            op = e.op
+            if op == 'PLUS':
+                self.text_lines.append('    add rax, rbx')
+            elif op == 'MINUS':
+                self.text_lines.append('    sub rax, rbx')
+            elif op == 'STAR':
+                self.text_lines.append('    imul rax, rbx')
+            elif op == 'SLASH' or op == 'PERCENT':
+                self.text_lines.append('    cqo')
+                self.text_lines.append('    idiv rbx')
+                if op == 'PERCENT':
+                    self.text_lines.append('    mov rax, rdx')
+            elif op in ('EQEQ','NEQ','LT','LTE','GT','GTE'):
+                self.text_lines.append('    cmp rax, rbx')
+                set_map = {
+                    'EQEQ': 'sete', 'NEQ': 'setne',
+                    'LT': 'setl', 'LTE': 'setle',
+                    'GT': 'setg', 'GTE': 'setge'
+                }
+                self.text_lines.append('    mov rax, 0')
+                self.text_lines.append(f'    {set_map[op]} al')
+            elif op in ('ANDAND','OROR'):
+                # short-circuit
+                if op == 'ANDAND':
+                    done = self._new_label('and_done')
+                    self.text_lines.append('    cmp rax, 0')
+                    self.text_lines.append(f'    je {done}')
+                    # rbx holds right
+                    self.text_lines.append('    mov rax, rbx')
+                    self.text_lines.append(f'{done}:')
+                    self.text_lines.append('    cmp rax, 0')
+                    self.text_lines.append('    mov rax, 0')
+                    self.text_lines.append('    setne al')
+                else:  # OROR
+                    done = self._new_label('or_done')
+                    self.text_lines.append('    cmp rax, 0')
+                    self.text_lines.append(f'    jne {done}')
+                    self.text_lines.append('    mov rax, rbx')
+                    self.text_lines.append(f'{done}:')
+                    self.text_lines.append('    cmp rax, 0')
+                    self.text_lines.append('    mov rax, 0')
+                    self.text_lines.append('    setne al')
+            return
+        self.text_lines.append('    ; <expr not implemented>')
+
+    def _declare_implicit(self, func: Function, name: str) -> str:
+        # Implicit variable if used without declaration (friendly for macros/tests)
+        lbl = f'{func.name}_var_{name}'
+        if name not in self._locals[func.name]:
+            self._locals[func.name][name] = lbl
+            self.bss_lines.append(f'{lbl}    dq 0')
+        return lbl
+
+    def _new_label(self, prefix: str) -> str:
+        v = f'{prefix}_{self.label_counter}'
+        self.label_counter += 1
+        return v
+
+    # --- Inline C: prefer Intel syntax, normalize to NASM ---
+    def _compile_c_to_asm(self, c_code: str) -> List[str]:
+        compiler = None
+        for cand in ('clang', 'gcc', 'tcc', 'cl'):
+            if shutil.which(cand):
+                compiler = cand
+                break
+        if compiler is None:
+            return []
+        # Prefer Intel syntax to reduce translation pain
+        tmpdir = tempfile.mkdtemp(prefix='den2_c_')
+        c_path = os.path.join(tmpdir, 'inline.c')
+        asm_path = os.path.join(tmpdir, 'inline.s' if compiler != 'cl' else 'inline.asm')
+        try:
+            with open(c_path, 'w', encoding='utf-8') as f:
+                f.write(c_code)
+
+            if compiler == 'clang':
+                cmd = ['clang', '-x', 'c', '-O2', '-S', c_path, '-o', asm_path,
+                       '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer', '-masm=intel', '-m64']
+            elif compiler == 'gcc':
+                cmd = ['gcc', '-x', 'c', '-O2', '-S', c_path, '-o', asm_path,
+                       '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer', '-masm=intel', '-m64']
+            elif compiler == 'tcc':
+                cmd = ['tcc', '-nostdlib', '-S', c_path, '-o', asm_path]
+            else:  # cl (MSVC)
+                return ['; [inline c compiler: cl]'] + self._compile_with_msvc(c_code)
+
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if not os.path.exists(asm_path):
+                return []
+
+            with open(asm_path, 'r', encoding='utf-8', errors='ignore') as f:
+                raw = f.read()
+
+            # Try Intel-to-NASM normalization first; if looks AT&T, fallback
+            if '%rip' not in raw and '$' not in raw and '%' not in raw and '.att_syntax' not in raw:
+                norm = self._intel_to_nasm(raw)
+                if norm:
+                    return [f'; [inline c compiler: {compiler}]'] + norm
+
+            translated = self._translate_att_to_nasm(raw)
+            if translated:
+                return [f'; [inline c compiler: {compiler}]'] + translated
+
+            return [f'; [inline c compiler: {compiler}]', '; [begin compiled C assembly]'] + \
+                   ['; ' + ln for ln in raw.splitlines()] + ['; [end compiled C assembly]']
+        except Exception as ex:
+            return [f'; [inline c compile error] {ex!r}']
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def _intel_to_nasm(self, intel_asm: str) -> List[str]:
+        out: List[str] = []
+        for line in intel_asm.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith(('.', '#', ';')):
+                # map sections, comment the rest
+                if s.startswith('.text'):
+                    out.append('section .text ; from intel')
+                elif s.startswith('.data'):
+                    out.append('section .data ; from intel')
+                elif s.startswith('.bss'):
+                    out.append('section .bss ; from intel')
+                elif s.startswith('.globl') or s.startswith('.global') or s.startswith('.type') or s.startswith('.size') or s.startswith('.ident') or s.startswith('.file'):
+                    continue
+                else:
+                    out.append('; ' + s)
+                continue
+            # label
+            if s.endswith(':'):
+                out.append(s)
+                continue
+            # strip comments starting with '#'
+            s = s.split(' #', 1)[0].rstrip()
+            out.append(s)
+        return out
+
+    def _translate_att_to_nasm(self, att_asm: str) -> List[str]:
+        out: List[str] = []
+        for line in att_asm.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith(('.', '#', ';')):
+                # map sections, comment the rest
+                if s.startswith('.text'):
+                    out.append('section .text ; from att')
+                elif s.startswith('.data'):
+                    out.append('section .data ; from att')
+                elif s.startswith('.bss'):
+                    out.append('section .bss ; from att')
+                elif s.startswith('.globl') or s.startswith('.global') or s.startswith('.type') or s.startswith('.size') or s.startswith('.ident') or s.startswith('.file'):
+                    continue
+                else:
+                    out.append('; ' + s)
+                continue
+            # label
+            if s.endswith(':'):
+                out.append(s)
+                continue
