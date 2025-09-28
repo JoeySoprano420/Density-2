@@ -2234,3 +2234,1541 @@ def generate_nasm(ast_or_source: Union[Program, str]) -> str:
     raise TypeError(f"generate_nasm expects Program or str, got {type(ast_or_source).__name__}")
 
 class CodeGenerator: ()
+
+#!/usr/bin/env python3
+# Density 2 compiler: lexer + parser + macro expander + NASM codegen + CLI
+
+import os
+import re
+import sys
+import shutil
+import subprocess
+import tempfile
+import time
+import hashlib
+from typing import List, Tuple, Union, Dict, Optional
+from density2_dbg import start_debugger
+
+# -----------------------------
+# Token Definitions
+# -----------------------------
+TOKEN_SPECIFICATION = [
+    # Blocks first (non-greedy to avoid overconsumption)
+    ('CIAM',        r"'''(.*?),,,"),              # ''' ... ,,,
+    ('INLINE_ASM',  r"#asm(.*?)#endasm"),
+    ('INLINE_C',    r"#c(.*?)#endc"),
+    ('INLINE_PY',   r"#python(.*?)#endpython"),
+
+    # Comments
+    ('COMMENT',     r'//[^\n]*'),
+    ('MCOMMENT',    r'/\*.*?\*/'),
+
+    # Literals and identifiers
+    ('STRING',      r'"(?:\\.|[^"\\])*"'),
+    ('IDENT',       r'[A-Za-z_][A-Za-z0-9_]*'),
+
+    # Symbols
+    ('LBRACE',      r'\{'),
+    ('RBRACE',      r'\}'),
+    ('LPAREN',      r'\('),
+    ('RPAREN',      r'\)'),
+    ('COLON',       r':'),
+    ('SEMICOLON',   r';'),
+    ('COMMA',       r','),         # macro args
+    ('PLUS',        r'\+'),        # string concat
+
+    # Whitespace, newline, and mismatch
+    ('NEWLINE',     r'\n'),
+    ('SKIP',        r'[ \t]+'),
+    ('MISMATCH',    r'.'),
+]
+
+# Ensure CIAM is non-greedy explicitly
+TOKEN_SPECIFICATION = [
+    (name, (pattern if name != 'CIAM' else r"'''(.*?),,,"))
+    for (name, pattern) in TOKEN_SPECIFICATION
+]
+
+token_regex = '|'.join('(?P<%s>%s)' % pair for pair in TOKEN_SPECIFICATION)
+_TOKEN_RE = re.compile(token_regex, re.DOTALL)
+
+# -----------------------------
+# Language ruleset/dictionary (read-only, for tooling; cheap to access)
+# -----------------------------
+KEYWORDS = frozenset(('Main', 'Print', 'If', 'Else', 'While', 'For', 'Return', 'Let', 'Const', 'Include', 'Import'))
+INLINE_LANGUAGES = frozenset(('asm', 'c', 'python', 'py', 'js', 'lua', 'zig', 'rust', 'cs', 'cpp', 'wasm', 'shell'))
+NASM_DIRECTIVES = frozenset(('section', 'global', 'extern', 'align', 'db', 'dw', 'dd', 'dq', 'resb', 'resw', 'resd', 'resq'))
+REGISTERS_X86_64 = frozenset((
+    'rax','rbx','rcx','rdx','rsi','rdi','rbp','rsp',
+    'r8','r9','r10','r11','r12','r13','r14','r15',
+    'eax','ebx','ecx','edx','esi','edi','ebp','esp',
+    'r8d','r9d','r10d','r11d','r12d','r13d','r14d','r15d',
+    'ax','bx','cx','dx','si','di','bp','sp',
+    'r8w','r9w','r10w','r11w','r12w','r13w','r14w','r15w',
+    'al','bl','cl','dl','sil','dil','bpl','spl',
+    'r8b','r9b','r10b','r11b','r12b','r13b','r14b','r15b'
+))
+SYSCALL_AMD64_LINUX = {
+    'read': 0, 'write': 1, 'open': 2, 'close': 3, 'stat': 4, 'fstat': 5, 'lstat': 6,
+    'mmap': 9, 'mprotect': 10, 'munmap': 11, 'brk': 12,
+    'rt_sigaction': 13, 'rt_sigprocmask': 14, 'ioctl': 16, 'pread64': 17, 'pwrite64': 18,
+    'readv': 19, 'writev': 20, 'access': 21, 'pipe': 22, 'select': 23,
+    'nanosleep': 35, 'getpid': 39, 'getppid': 110, 'exit': 60, 'wait4': 61, 'kill': 62, 'uname': 63,
+}
+INLINE_BLOCK_MARKERS = {'asm': ('#asm', '#endasm'), 'c': ('#c', '#endc'), 'python': ('#python', '#endpython'), 'py': ('#python', '#endpython')}
+
+LANG_RULESET: Dict[str, object] = {
+    'tokens': tuple(name for name, _ in TOKEN_SPECIFICATION),
+    'keywords': KEYWORDS,
+    'inline_languages': INLINE_LANGUAGES,
+    'inline_markers': INLINE_BLOCK_MARKERS,
+    'nasm_directives': NASM_DIRECTIVES,
+    'registers_x86_64': REGISTERS_X86_64,
+    'statement_syntax': {
+        'Print': 'Print: ("string" [+ "string"]*) ;',
+        'CIAM': "'''Name(param, ...)\\n<density2...>\\n,,,",
+        'MacroCall': 'Name(arg, ...) ;',
+        'InlineBlock': '#asm|#c|#python ... #endasm|#endc|#endpython',
+    },
+    'notes': 'CIAM/inline blocks non-greedy; functions are IDENT() with optional { body }.',
+}
+LANG_DICTIONARY: Dict[str, object] = {
+    'syscalls_amd64_linux': dict(SYSCALL_AMD64_LINUX),
+    'inline_languages': sorted(INLINE_LANGUAGES),
+    'nasm_directives': sorted(NASM_DIRECTIVES),
+    'registers_x86_64': sorted(REGISTERS_X86_64),
+}
+
+def get_ruleset() -> Dict[str, object]:
+    return dict(LANG_RULESET)
+
+def get_dictionary() -> Dict[str, object]:
+    return dict(LANG_DICTIONARY)
+
+
+class Token:
+    def __init__(self, type_: str, value: str, line: int, column: int):
+        self.type = type_
+        self.value = value
+        self.line = line
+        self.column = column
+
+    def __repr__(self):
+        return f"Token({self.type}, {self.value!r}, line={self.line}, col={self.column})"
+
+
+# -----------------------------
+# Lexer
+# -----------------------------
+def tokenize(code: str) -> List[Token]:
+    tokens: List[Token] = []
+    line_num = 1
+    line_start = 0
+    for mo in _TOKEN_RE.finditer(code):
+        kind = mo.lastgroup
+        value = mo.group()
+        column = mo.start() - line_start
+        if kind == 'NEWLINE':
+            line_num += 1
+            line_start = mo.end()
+            continue
+        elif kind in ('SKIP', 'COMMENT', 'MCOMMENT'):
+            continue
+        elif kind == 'MISMATCH':
+            raise RuntimeError(f'{value!r} unexpected on line {line_num}')
+        tokens.append(Token(kind, value, line_num, column))
+    return tokens
+
+
+# -----------------------------
+# AST Nodes
+# -----------------------------
+class ASTNode:
+    def __init__(
+        self,
+        *,
+        filename: Optional[str] = None,
+        line: Optional[int] = None,
+        col: Optional[int] = None,
+        end_line: Optional[int] = None,
+        end_col: Optional[int] = None,
+    ):
+        self.filename = filename
+        self.line = line
+        self.col = col
+        self.end_line = end_line
+        self.end_col = end_col
+
+    def set_pos(self, *, filename: Optional[str] = None, line: Optional[int] = None, col: Optional[int] = None,
+                end_line: Optional[int] = None, end_col: Optional[int] = None) -> "ASTNode":
+        if filename is not None:
+            self.filename = filename
+        if line is not None:
+            self.line = line
+        if col is not None:
+            self.col = col
+        if end_line is not None:
+            self.end_line = end_line
+        if end_col is not None:
+            self.end_col = end_col
+        return self
+
+    def _is_pos_field(self, name: str) -> bool:
+        return name in ("filename", "line", "col", "end_line", "end_col")
+
+    def _iter_fields(self):
+        for k, v in self.__dict__.items():
+            if k.startswith("_"):
+                continue
+            yield k, v
+
+    def children(self) -> List["ASTNode"]:
+        result: List[ASTNode] = []
+        for _, v in self._iter_fields():
+            if isinstance(v, ASTNode):
+                result.append(v)
+            elif isinstance(v, list):
+                for it in v:
+                    if isinstance(it, ASTNode):
+                        result.append(it)
+        return result
+
+    def walk(self):
+        yield self
+        for c in self.children():
+            yield from c.walk()
+
+    def accept(self, visitor):
+        method = getattr(visitor, f"visit_{self.__class__.__name__}", None)
+        if callable(method):
+            return method(self)
+        generic = getattr(visitor, "visit", None)
+        if callable(generic):
+            return generic(self)
+        return None
+
+    def replace_child(self, old: "ASTNode", new: Optional["ASTNode"]) -> bool:
+        changed = False
+        for k, v in list(self._iter_fields()):
+            if isinstance(v, ASTNode) and v is old:
+                setattr(self, k, new)
+                changed = True
+            elif isinstance(v, list):
+                new_list = []
+                for it in v:
+                    if it is old:
+                        if new is not None:
+                            new_list.append(new)
+                        changed = True
+                    else:
+                        new_list.append(it)
+                if changed:
+                    setattr(self, k, new_list)
+        return changed
+
+    def to_dict(self, *, include_pos: bool = True) -> Dict[str, object]:
+        d: Dict[str, object] = {"__type__": self.__class__.__name__}
+        for k, v in self._iter_fields():
+            if not include_pos and self._is_pos_field(k):
+                continue
+            if isinstance(v, ASTNode):
+                d[k] = v.to_dict(include_pos=include_pos)
+            elif isinstance(v, list):
+                d[k] = [(it.to_dict(include_pos=include_pos) if isinstance(it, ASTNode) else it) for it in v]
+            else:
+                d[k] = v
+        return d
+
+    def pretty(self, indent: str = "  ") -> str:
+        lines: List[str] = []
+        def rec(n: "ASTNode", depth: int):
+            pad = indent * depth
+            header = n.__class__.__name__
+            pos = []
+            if n.filename:
+                pos.append(f'file="{n.filename}"')
+            if n.line is not None and n.col is not None:
+                pos.append(f"@{n.line}:{n.col}")
+            if n.end_line is not None and n.end_col is not None:
+                pos.append(f"-{n.end_line}:{n.end_col}")
+            if pos:
+                header += " [" + " ".join(pos) + "]"
+            lines.append(pad + header)
+            for k, v in n._iter_fields():
+                if isinstance(v, ASTNode):
+                    continue
+                if isinstance(v, list) and any(isinstance(it, ASTNode) for it in v):
+                    continue
+                lines.append(pad + indent + f"{k} = {v!r}")
+            for k, v in n._iter_fields():
+                if isinstance(v, ASTNode):
+                    lines.append(pad + indent + f"{k}:")
+                    rec(v, depth + 2)
+                elif isinstance(v, list):
+                    child_nodes = [it for it in v if isinstance(it, ASTNode)]
+                    if child_nodes:
+                        lines.append(pad + indent + f"{k}: [{len(child_nodes)}]")
+                        for it in child_nodes:
+                            rec(it, depth + 2)
+        rec(self, 0)
+        return "\n".join(lines)
+
+    def copy(self, **overrides):
+        cls = self.__class__
+        new_obj = cls.__new__(cls)  # type: ignore
+        new_obj.__dict__.update(self.__dict__)
+        for k, v in overrides.items():
+            setattr(new_obj, k, v)
+        return new_obj
+
+    def to_dodecagram(self) -> str:
+        f = globals().get("ast_to_dodecagram")
+        if callable(f):
+            return f(self)  # type: ignore[misc]
+        raise RuntimeError("ast_to_dodecagram() is not available in this module")
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ASTNode):
+            return False
+        if self.__class__ is not other.__class__:
+            return False
+        return self.to_dict(include_pos=False) == other.to_dict(include_pos=False)
+
+    def __repr__(self) -> str:
+        fields: List[str] = []
+        for k, v in self._iter_fields():
+            if isinstance(v, ASTNode):
+                continue
+            if isinstance(v, list) and any(isinstance(it, ASTNode) for it in v):
+                continue
+            fields.append(f"{k}={v!r}")
+        inner = ", ".join(fields)
+        return f"{self.__class__.__name__}({inner})"
+
+
+class Program(ASTNode):
+    def __init__(self, functions: List['Function']):
+        self.functions = functions
+
+    def __repr__(self):
+        return f"Program({self.functions})"
+
+
+class Function(ASTNode):
+    def __init__(self, name: str, body: List['Statement']):
+        self.name = name
+        self.body = body
+
+    def __repr__(self):
+        return f"Function({self.name}, body={self.body})"
+
+
+class Statement(ASTNode):
+    pass
+
+
+class PrintStatement(Statement):
+    def __init__(self, text: str):
+        self.text = text
+
+    def __repr__(self):
+        return f"Print({self.text!r})"
+
+
+class CIAMBlock(Statement):
+    def __init__(self, name: str, params: List[str], body_text: str):
+        self.name = name
+        self.params = params
+        self.body_text = body_text
+
+    def __repr__(self):
+        return f"CIAMBlock(name={self.name!r}, params={self.params}, body_len={len(self.body_text)})"
+
+
+class MacroCall(Statement):
+    def __init__(self, name: str, arg_texts: List[str]):
+        self.name = name
+        self.arg_texts = arg_texts
+
+    def __repr__(self):
+        return f"MacroCall({self.name!r}, args={self.arg_texts})"
+
+
+class InlineBlock(Statement):
+    def __init__(self, lang: str, content: str):
+        self.lang = lang  # 'asm', 'c', 'python'
+        self.content = content
+
+    def __repr__(self):
+        return f"InlineBlock(lang={self.lang!r}, content_len={len(self.content)})"
+
+
+# -----------------------------
+# Dodecagram AST encoding
+# -----------------------------
+_DODECAGRAM_MAP = {
+    'Program': '0',
+    'Function': '1',
+    'PrintStatement': '2',
+    'CIAMBlock': '3',
+    'MacroCall': '4',
+    'InlineBlock:asm': '5',
+    'InlineBlock:python': '6',
+    'InlineBlock:py': '6',
+    'InlineBlock:c': '7',
+    'InlineBlock:other': '8',
+    '_reserved9': '9',
+    '_reserveda': 'a',
+    '_reservedb': 'b',
+}
+
+def ast_to_dodecagram(node: ASTNode) -> str:
+    def enc(n: ASTNode) -> str:
+        if isinstance(n, Program):
+            s = _DODECAGRAM_MAP['Program']
+            for f in n.functions:
+                s += enc(f)
+            return s
+        if isinstance(n, Function):
+            s = _DODECAGRAM_MAP['Function']
+            for st in n.body:
+                s += enc(st)
+            return s
+        if isinstance(n, PrintStatement):
+            return _DODECAGRAM_MAP['PrintStatement']
+        if isinstance(n, CIAMBlock):
+            return _DODECAGRAM_MAP['CIAMBlock']
+        if isinstance(n, MacroCall):
+            return _DODECAGRAM_MAP['MacroCall']
+        if isinstance(n, InlineBlock):
+            key = f'InlineBlock:{n.lang}'
+            ch = _DODECAGRAM_MAP.get(key, _DODECAGRAM_MAP['InlineBlock:other'])
+            return ch
+        return _DODECAGRAM_MAP['_reserved9']
+    return enc(node)
+
+
+# -----------------------------
+# Parser
+# -----------------------------
+class Parser:
+    def __init__(self, tokens: List[Token]):
+        self.tokens = tokens
+        self.pos = 0
+        self.macro_table: Dict[str, CIAMBlock] = {}
+
+    def peek(self) -> Optional[Token]:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def lookahead(self, offset: int) -> Optional[Token]:
+        idx = self.pos + offset
+        if 0 <= idx < len(self.tokens):
+            return self.tokens[idx]
+        return None
+
+    def consume(self, expected_type: str) -> Token:
+        tok = self.peek()
+        if not tok or tok.type != expected_type:
+            raise SyntaxError(f"Expected {expected_type}, got {tok}")
+        self.pos += 1
+        return tok
+
+    def match(self, expected_type: str) -> bool:
+        tok = self.peek()
+        if tok and tok.type == expected_type:
+            self.pos += 1
+            return True
+        return False
+
+    def parse(self) -> Program:
+        functions: List[Function] = []
+        while self.peek() is not None:
+            tok = self.peek()
+            if tok.type == 'IDENT':
+                if self.lookahead(1) and self.lookahead(1).type == 'LPAREN':
+                    functions.append(self.parse_function())
+                else:
+                    self.pos += 1
+            else:
+                self.pos += 1
+        return Program(functions)
+
+    def parse_function(self) -> Function:
+        name_tok = self.consume('IDENT')
+        self.consume('LPAREN')
+        self.consume('RPAREN')
+        body: List[Statement] = []
+        if self.match('LBRACE'):
+            body = self.parse_statements_until_rbrace()
+            self.consume('RBRACE')
+        else:
+            stmt = self.parse_statement()
+            if stmt:
+                body.append(stmt)
+        return Function(name_tok.value, body)
+
+    def parse_statements_until_rbrace(self) -> List[Statement]:
+        stmts: List[Statement] = []
+        while True:
+            tok = self.peek()
+            if tok is None or tok.type == 'RBRACE':
+                break
+            stmt = self.parse_statement()
+            if stmt:
+                if isinstance(stmt, list):
+                    stmts.extend(stmt)
+                else:
+                    stmts.append(stmt)
+        return stmts
+
+    def parse_statement(self) -> Optional[Union[Statement, List[Statement]]]:
+        tok = self.peek()
+        if tok is None:
+            return None
+
+        if tok.type == 'IDENT' and tok.value == 'Print':
+            return self.parse_print()
+
+        if tok.type == 'CIAM':
+            ciam_tok = self.consume('CIAM')
+            content = ciam_tok.value
+            if content.startswith("'''"):
+                content_inner = content[3:]
+                if content_inner.endswith(",,,"):
+                    content_inner = content_inner[:-3]
+            else:
+                content_inner = content
+            name, params, body_text = self._parse_ciam_content(content_inner.strip(), ciam_tok)
+            ciam_block = CIAMBlock(name, params, body_text)
+            self.macro_table[name] = ciam_block
+            return None
+
+        if tok.type.startswith('INLINE_'):
+            return self.parse_inline_block()
+
+        if tok.type == 'IDENT':
+            la = self.lookahead(1)
+            if la and la.type == 'LPAREN':
+                return self.parse_macro_call()
+            else:
+                self.pos += 1
+                return None
+
+        self.pos += 1
+        return None
+
+    def _parse_ciam_content(self, content: str, tok: Token) -> Tuple[str, List[str], str]:
+        lines = content.splitlines()
+        if not lines:
+            raise SyntaxError(f"Empty CIAM at line {tok.line}")
+        header = lines[0].strip()
+        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)\s*$', header)
+        if not m:
+            raise SyntaxError(f"Invalid CIAM header '{header}' at line {tok.line}")
+        name = m.group(1)
+        params_str = m.group(2).strip()
+        params = [p.strip() for p in params_str.split(',') if p.strip()] if params_str else []
+        body_text = '\n'.join(lines[1:]).strip()
+        return name, params, body_text
+
+    def parse_macro_call(self) -> MacroCall:
+        name_tok = self.consume('IDENT')
+        self.consume('LPAREN')
+        args: List[str] = []
+        current_parts: List[str] = []
+        paren_depth = 1
+        while True:
+            tok = self.peek()
+            if tok is None:
+                raise SyntaxError("Unclosed macro call")
+            if tok.type == 'LPAREN':
+                paren_depth += 1
+                current_parts.append(tok.value)
+                self.pos += 1
+            elif tok.type == 'RPAREN':
+                paren_depth -= 1
+                if paren_depth == 0:
+                    arg_text = ''.join(current_parts).strip()
+                    if arg_text:
+                        args.append(arg_text)
+                    self.pos += 1
+                    break
+                else:
+                    current_parts.append(tok.value)
+                    self.pos += 1
+            elif tok.type == 'COMMA' and paren_depth == 1:
+                arg_text = ''.join(current_parts).strip()
+                args.append(arg_text)
+                current_parts = []
+                self.pos += 1
+            else:
+                current_parts.append(tok.value)
+                self.pos += 1
+        self.consume('SEMICOLON')
+        return MacroCall(name_tok.value, args)
+
+    def parse_inline_block(self) -> InlineBlock:
+        tok = self.peek()
+        lang = tok.type.split('_', 1)[1].lower()
+        inline_tok = self.consume(tok.type)
+        content = re.sub(r'^#\w+', '', inline_tok.value, flags=re.DOTALL)
+        content = re.sub(r'#end\w+$', '', content, flags=re.DOTALL)
+        return InlineBlock(lang, content.strip())
+
+    def parse_print(self) -> PrintStatement:
+        self.consume('IDENT')  # 'Print'
+        self.consume('COLON')
+        self.consume('LPAREN')
+
+        parts: List[str] = []
+        first = True
+        while True:
+            tok = self.peek()
+            if not tok:
+                raise SyntaxError("Unclosed Print: missing ')'")
+            if first:
+                if tok.type != 'STRING':
+                    raise SyntaxError(f"Print expects a string literal, got {tok}")
+                parts.append(eval(tok.value))
+                self.pos += 1
+                first = False
+            else:
+                if tok.type == 'PLUS':
+                    self.pos += 1
+                    tok2 = self.peek()
+                    if not tok2 or tok2.type != 'STRING':
+                        raise SyntaxError("Expected string after '+' in Print")
+                    parts.append(eval(tok2.value))
+                    self.pos += 1
+                else:
+                    break
+
+        self.consume('RPAREN')
+        self.consume('SEMICOLON')
+        full_text = ''.join(parts)
+        return PrintStatement(full_text)
+
+
+# -----------------------------
+# Macro Expansion
+# -----------------------------
+def expand_macros(program: Program, macro_table: Dict[str, CIAMBlock], max_depth: int = 32) -> Program:
+    def expand_statements(stmts: List[Statement], depth: int) -> List[Statement]:
+        result: List[Statement] = []
+        for s in stmts:
+            if isinstance(s, MacroCall):
+                if s.name not in macro_table:
+                    continue
+                macro = macro_table[s.name]
+                expanded = expand_macro_call(macro, s, depth)
+                result.extend(expanded)
+            else:
+                result.append(s)
+        return result
+
+    def expand_macro_call(macro: CIAMBlock, call: MacroCall, depth: int) -> List[Statement]:
+        if depth <= 0:
+            raise RecursionError("Macro expansion depth exceeded")
+        body = macro.body_text
+        mapping = {p: (call.arg_texts[i] if i < len(call.arg_texts) else '') for i, p in enumerate(macro.params)}
+        for p, a in mapping.items():
+            body = re.sub(rf'\b{re.escape(p)}\b', a, body)
+        sub_tokens = tokenize(body)
+        sub_parser = Parser(sub_tokens)
+        sub_parser.macro_table = macro_table
+        sub_stmts = sub_parser.parse_statements_until_rbrace()
+        return expand_statements(sub_stmts, depth - 1)
+
+    new_functions: List[Function] = []
+    for f in program.functions:
+        expanded_body = expand_statements(f.body, max_depth)
+        new_functions.append(Function(f.name, expanded_body))
+    return Program(new_functions)
+
+
+# -----------------------------
+# NASM Emitter
+# -----------------------------
+class CodeGenerator:
+    def __init__(self, ast: Program):
+        self.ast = ast
+        self.text_lines: List[str] = []
+        self.data_lines: List[str] = []
+        self.string_table: Dict[str, str] = {}
+        self.label_counter = 0
+        self._reg_cache = {'rax_sys_write': False, 'rdi_stdout': False}
+
+    def generate(self) -> str:
+        self.text_lines = []
+        self.data_lines = []
+        self.string_table = {}
+        self.label_counter = 0
+        self._invalidate_reg_cache()
+
+        self._emit_header()
+        for func in self.ast.functions:
+            self._emit_function(func)
+
+        final_lines: List[str] = []
+        final_lines.append('section .data')
+        final_lines.extend('    ' + line for line in self.data_lines)
+        final_lines.append('section .text')
+        final_lines.append('    global _start')
+        for l in self.text_lines:
+            final_lines.append(l)
+
+        return '\n'.join(final_lines)
+
+    def _invalidate_reg_cache(self):
+        self._reg_cache['rax_sys_write'] = False
+        self._reg_cache['rdi_stdout'] = False
+
+    def _emit_header(self):
+        self.text_lines.append('; --- Density 2 NASM output ---')
+        self.text_lines.append('; inline C: compiled then translated (best-effort)')
+        self.text_lines.append('; inline Python: executed at codegen; use emit("...") to output NASM')
+
+    def _emit_function(self, func: Function):
+        if func.name == 'Main':
+            self.text_lines.append('_start:')
+        else:
+            self.text_lines.append(f'{func.name}:')
+        self._invalidate_reg_cache()
+
+        for stmt in func.body:
+            if isinstance(stmt, PrintStatement):
+                self._emit_print(stmt.text)
+            elif isinstance(stmt, InlineBlock):
+                self._emit_inline(stmt)
+                self._invalidate_reg_cache()
+            elif isinstance(stmt, CIAMBlock):
+                self.text_lines.append(f'    ; CIAMBlock ignored (should be expanded): {getattr(stmt, "name", "?")}')
+            elif isinstance(stmt, MacroCall):
+                self.text_lines.append(f'    ; MacroCall ignored (should be expanded): {getattr(stmt, "name", "?")}')
+            else:
+                self.text_lines.append('    ; Unknown statement')
+
+        if func.name == 'Main':
+            self._emit_exit()
+
+    def _encode_string_bytes(self, s: str) -> List[int]:
+        return list(s.encode('utf-8'))
+
+    def _get_string_label(self, text: str) -> Tuple[str, int]:
+        if text not in self.string_table:
+            label = f'str_{self.label_counter}'
+            self.label_counter += 1
+            data_bytes = self._encode_string_bytes(text)
+            stored = data_bytes + [10, 0]  # newline + NUL
+            bytes_list = ', '.join(str(b) for b in stored)
+            self.data_lines.append(f'{label} db {bytes_list}')
+            length = len(data_bytes) + 1  # include newline, exclude NUL
+            self.string_table[text] = label
+        else:
+            label = self.string_table[text]
+            data_bytes = self._encode_string_bytes(text)
+            length = len(data_bytes) + 1
+        return label, length
+
+    def _emit_print(self, text: str):
+        label, length = self._get_string_label(text)
+        if not self._reg_cache['rax_sys_write']:
+            self.text_lines.append(f'    mov rax, 1          ; sys_write')
+            self._reg_cache['rax_sys_write'] = True
+        if not self._reg_cache['rdi_stdout']:
+            self.text_lines.append(f'    mov rdi, 1          ; stdout')
+            self._reg_cache['rdi_stdout'] = True
+        self.text_lines.append(f'    mov rsi, {label}    ; message')
+        self.text_lines.append(f'    mov rdx, {length}         ; length (bytes)')
+        self.text_lines.append('    syscall')
+
+    def _emit_exit(self):
+        self.text_lines.append('    mov rax, 60         ; sys_exit')
+        self.text_lines.append('    xor rdi, rdi        ; status 0')
+        self.text_lines.append('    syscall')
+        self._invalidate_reg_cache()
+
+    def _emit_inline(self, block: InlineBlock):
+        if block.lang == 'asm':
+            self.text_lines.append('    ; inline NASM start')
+            for line in block.content.splitlines():
+                line = line.rstrip()
+                if line:
+                    self.text_lines.append('    ' + line)
+            self.text_lines.append('    ; inline NASM end')
+        elif block.lang in ('py', 'python'):
+            self.text_lines.append('    ; inline Python start')
+            for line in self._run_inline_python(block.content):
+                self.text_lines.append('    ' + line)
+            self.text_lines.append('    ; inline Python end')
+        elif block.lang == 'c':
+            self.text_lines.append('    ; inline C start')
+            asm_lines = self._compile_c_to_asm(block.content)
+            if asm_lines:
+                for l in asm_lines:
+                    self.text_lines.append('    ' + l)
+            else:
+                for line in block.content.splitlines():
+                    self.text_lines.append('    ; ' + line)
+                self.text_lines.append('    ; (no C compiler found; block left as comment)')
+            self.text_lines.append('    ; inline C end')
+        else:
+            for line in block.content.splitlines():
+                self.text_lines.append(f'    ; inline {block.lang} ignored: {line}')
+
+    def _run_inline_python(self, code: str) -> List[str]:
+        lines: List[str] = []
+        def emit(s: str):
+            if not isinstance(s, str):
+                raise TypeError("emit() expects a string")
+            lines.append(s)
+        def label(prefix: str = 'gen'):
+            lbl = f'{prefix}_{self.label_counter}'
+            self.label_counter += 1
+            return lbl
+        globals_dict = {'__builtins__': {'range': range, 'len': len, 'str': str, 'int': int, 'print': print}, 'emit': emit, 'label': label}
+        try:
+            exec(code, globals_dict, {})
+        except Exception as ex:
+            lines.append(f'; [inline python error] {ex!r}')
+        return lines
+
+    def _compile_c_to_asm(self, c_code: str) -> List[str]:
+        for cand in ('tcc', 'clang', 'gcc', 'cl'):
+            if shutil.which(cand):
+                compiler = cand
+                break
+        else:
+            return []
+
+        if compiler == 'cl':
+            return ['; [inline c compiler: cl]'] + self._compile_with_msvc(c_code)
+
+        tmpdir = tempfile.mkdtemp(prefix='den2_c_')
+        c_path = os.path.join(tmpdir, 'inline.c')
+        asm_path = os.path.join(tmpdir, 'inline.s')
+        try:
+            with open(c_path, 'w', encoding='utf-8') as f:
+                f.write(c_code)
+
+            if compiler == 'tcc':
+                cmd = [compiler, '-nostdlib', '-S', c_path, '-o', asm_path]
+            elif compiler == 'clang':
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+            else:  # gcc
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if not os.path.exists(asm_path):
+                return []
+
+            with open(asm_path, 'r', encoding='utf-8', errors='ignore') as f:
+                raw = f.read()
+
+            translated = self._translate_att_to_nasm(raw)
+            if translated:
+                return [f'; [inline c compiler: {compiler}]'] + translated
+
+            commented = [f'; [inline c compiler: {compiler}]', '; [begin compiled C assembly]']
+            commented += ['; ' + line for line in raw.splitlines()]
+            commented.append('; [end compiled C assembly]')
+            return commented
+        except Exception as ex:
+            return [f'; [inline c compile error] {ex!r}']
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def _compile_with_msvc(self, c_code: str) -> List[str]:
+        tmpdir = tempfile.mkdtemp(prefix='den2_msvc_')
+        try:
+            c_path = os.path.join(tmpdir, 'inline.c')
+            with open(c_path, 'w', encoding='utf-8') as f:
+                f.write(c_code)
+
+            cmd = ['cl', '/nologo', '/FA', '/c', os.path.basename(c_path)]
+            proc = subprocess.run(cmd, cwd=tmpdir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            asm_listing = os.path.join(tmpdir, 'inline.asm')
+            lines: List[str] = []
+
+            if proc.stdout:
+                for ln in proc.stdout.splitlines():
+                    if ln.strip():
+                        lines.append('; [cl] ' + ln)
+            if proc.returncode != 0 and proc.stderr:
+                for ln in proc.stderr.splitlines():
+                    if ln.strip():
+                        lines.append('; [cl err] ' + ln)
+
+            if os.path.exists(asm_listing):
+                with open(asm_listing, 'r', encoding='utf-8', errors='ignore') as f:
+                    raw = f.read()
+                translated = self._msvc_asm_to_nasm(raw)
+                return lines + translated
+
+            return lines
+        except Exception as ex:
+            return [f'; [inline c compile (msvc) error] {ex!r}']
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def _msvc_asm_to_nasm(self, msvc_asm: str) -> List[str]:
+        out: List[str] = []
+        for line in msvc_asm.splitlines():
+            s = line.rstrip()
+            if not s:
+                continue
+            if s.lstrip().startswith(';'):
+                out.append(s)
+                continue
+            tok = s.strip()
+            up = tok.upper()
+            if up.startswith(('TITLE ', 'COMMENT ', 'INCLUDE ', 'INCLUDELIB ')):
+                continue
+            if up.startswith(('.MODEL', '.CODE', '.DATA', '.CONST', '.XDATA', '.PDATA', '.STACK', '.LIST', '.686', '.686P', '.XMM', '.X64')):
+                continue
+            if up.startswith(('PUBLIC ', 'EXTRN ', 'EXTERN ', 'ASSUME ')):
+                continue
+            if up == 'END':
+                continue
+            if up.startswith('ALIGN '):
+                parts = tok.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    out.append(f'align {parts[1]}')
+                continue
+            m_proc = re.match(r'^([A-Za-z_$.@?][\w$.@?]*)\s+PROC\b', tok)
+            if m_proc:
+                out.append(f'{m_proc.group(1)}:')
+                continue
+            if re.match(r'^[A-Za-z_$.@?][\w$.@?]*\s+ENDP\b', tok):
+                continue
+            m_data = re.match(r'^(DB|DW|DD|DQ)\b(.*)$', tok, re.IGNORECASE)
+            if m_data:
+                out.append(m_data.group(1).lower() + m_data.group(2))
+                continue
+            tok = re.sub(r'\b(BYTE|WORD|DWORD|QWORD)\s+PTR\b', lambda m: m.group(1).lower(), tok)
+            tok = re.sub(r'\bOFFSET\s+FLAT:', '', tok, flags=re.IGNORECASE)
+            tok = re.sub(r'\bOFFSET\s+', '', tok, flags=re.IGNORECASE)
+            tok = tok.replace(' FLAT:', ' ')
+            out.append(tok)
+        return out
+
+    def _translate_att_to_nasm(self, att_asm: str) -> List[str]:
+        out: List[str] = []
+        for line in att_asm.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith('.'):
+                if s.startswith(('.globl', '.global', '.text', '.data', '.bss', '.rodata', '.section', '.type', '.size', '.file', '.ident', '.cfi', '.p2align', '.intel_syntax', '.att_syntax')):
+                    continue
+                out.append(f'; {s}')
+                continue
+            if s.endswith(':'):
+                out.append(s)
+                continue
+            s = s.split('\t#', 1)[0].split(' #', 1)[0].strip()
+            if not s:
+                continue
+            parts = s.split(None, 1)
+            op = parts[0]
+            rest = parts[1] if len(parts) > 1 else ''
+            op_n = re.sub(r'(q|l|w|b)$', '', op)
+            ops = [o.strip() for o in rest.split(',')] if rest else []
+            ops = [self._att_operand_to_nasm(o) for o in ops]
+            if len(ops) == 2:
+                ops = [ops[1], ops[0]]
+            if ops:
+                out.append(f'{op_n} ' + ', '.join(ops))
+            else:
+                out.append(op_n)
+        return out
+
+    def _att_operand_to_nasm(self, o: str) -> str:
+        o = o.strip()
+        if o.startswith('$'):
+            return o[1:]
+        o = re.sub(r'%([a-zA-Z][a-zA-Z0-9]*)', r'\1', o)
+        m = re.match(r'^\s*([\-+]?\d+)?\s*\(\s*([a-zA-Z0-9%]+)\s*(?:,\s*([a-zA-Z0-9%]+)\s*(?:,\s*(\d+))?)?\s*\)\s*$', o)
+        if m:
+            disp, base, index, scale = m.groups()
+            base = base.lstrip('%')
+            parts = [base]
+            if index:
+                idx = index.lstrip('%')
+                sc = int(scale) if scale else 1
+                parts.append(f'{idx}*{sc}')
+            addr = ' + '.join(parts) if parts else ''
+            if disp:
+                sign = '+' if int(disp) >= 0 else '-'
+                addr = f'{addr} {sign} {abs(int(disp))}' if addr else str(disp)
+            return f'[{addr}]'
+        return o
+
+
+# -----------------------------
+# Public API
+# -----------------------------
+def generate_nasm(ast_or_source: Union[Program, str]) -> str:
+    """
+    Generate NASM assembly.
+    - If given a Program AST, emit NASM via CodeGenerator.
+    - If given Density 2 source (str), parse, expand macros, then emit NASM.
+    - If given an assembly-looking string (already NASM), return as-is.
+    """
+    if isinstance(ast_or_source, Program):
+        gen = CodeGenerator(ast_or_source)
+        return gen.generate()
+
+    if isinstance(ast_or_source, str):
+        text = ast_or_source
+        if re.search(r'^\s*section\s+\.text\b', text, flags=re.MULTILINE) and 'global _start' in text:
+            return text
+        tokens = tokenize(text)
+        parser = Parser(tokens)
+        program = parser.parse()
+        program = expand_macros(program, parser.macro_table)
+        gen = CodeGenerator(program)
+        return gen.generate()
+
+    raise TypeError(f"generate_nasm expects Program or str, got {type(ast_or_source).__name__}")
+
+
+def parse_density2(code: str) -> Program:
+    tokens = tokenize(code)
+    parser = Parser(tokens)
+    program = parser.parse()
+    return expand_macros(program, parser.macro_table)
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: density2_compiler.py <input.den2> [--debug]")
+        sys.exit(2)
+
+    debug_mode = '--debug' in sys.argv
+    src_path = next((a for a in sys.argv[1:] if not a.startswith('--')), None)
+    if not src_path or not os.path.exists(src_path):
+        print("Input file not found.")
+        sys.exit(2)
+
+    with open(src_path, 'r', encoding='utf-8') as f:
+        source = f.read()
+
+    if debug_mode:
+        print("🔍 Entering Density 2 Debugger...")
+        program = parse_density2(source)
+        start_debugger(program, filename=src_path)
+        return
+
+    asm = generate_nasm(source)
+    out_path = os.path.join(os.path.dirname(src_path) or '.', 'out.asm')
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(asm)
+    print("✅ NASM written to", out_path)
+
+
+if __name__ == '__main__':
+    main()
+
+    #!/usr/bin/env python3
+
+import os
+import shlex
+import traceback
+from typing import Any, Optional, List, Dict, Callable
+
+
+def _import_compiler():
+    import importlib
+    return importlib.import_module('density2_compiler')
+
+
+def _is_program(obj: Any) -> bool:
+    try:
+        d2c = _import_compiler()
+        return isinstance(obj, d2c.Program)
+    except Exception:
+        return False
+
+
+def _ast_pretty(n: Any) -> str:
+    p = getattr(n, 'pretty', None)
+    if callable(p):
+        try:
+            return p()
+        except Exception:
+            pass
+    return repr(n)
+
+
+def _ast_dodecagram(n: Any) -> str:
+    f = getattr(n, 'to_dodecagram', None)
+    if callable(f):
+        try:
+            return f()
+        except Exception:
+            pass
+    return ''
+
+
+def _ast_encode_history(n: Any, recursive: bool = False) -> str:
+    f = getattr(n, 'encode_history', None)
+    if callable(f):
+        try:
+            return f(recursive=recursive)
+        except Exception:
+            pass
+    return ''
+
+
+def _ast_enable_tracking(n: Any, enable: bool, recursive: bool) -> None:
+    f = getattr(n, 'enable_mutation_tracking', None)
+    if callable(f):
+        try:
+            f(enable=enable, recursive=recursive)
+        except Exception:
+            pass
+
+
+def _get_fn_name(fn: Any) -> str:
+    return getattr(fn, 'name', '<unnamed>')
+
+
+def _get_fn_body(fn: Any) -> List[Any]:
+    return getattr(fn, 'body', []) or []
+
+
+def _node_type(n: Any) -> str:
+    return n.__class__.__name__
+
+
+def _safe_eval(expr: str, env: Dict[str, Any]) -> Any:
+    safe_globals = {"__builtins__": {}}
+    safe_globals.update(env)
+    return eval(expr, safe_globals, {})
+
+
+class DebugSession:
+    def __init__(self, ast_or_source: Any, filename: Optional[str] = None):
+        self.filename = filename
+        self.source: Optional[str] = None
+        self.program_raw = None
+        self.program = None
+        self.fn_index: int = 0
+        self.stmt_index: int = 0
+        self.commands: Dict[str, Callable[[List[str]], None]] = {
+            'help': self.cmd_help,
+            '?': self.cmd_help,
+            'quit': self.cmd_quit,
+            'exit': self.cmd_quit,
+            'info': self.cmd_info,
+            'tree': self.cmd_tree,
+            'funcs': self.cmd_funcs,
+            'use': self.cmd_use,
+            'list': self.cmd_list,
+            'show': self.cmd_show,
+            'step': self.cmd_step,
+            'reset': self.cmd_reset,
+            'dodecagram': self.cmd_dodecagram,
+            'track': self.cmd_track,
+            'history': self.cmd_history,
+            'walk': self.cmd_walk,
+            'find': self.cmd_find,
+            'eval': self.cmd_eval,
+            'emit': self.cmd_emit,
+            'write': self.cmd_write,
+            'reload': self.cmd_reload,
+            'rules': self.cmd_rules,
+            'dict': self.cmd_dict,
+        }
+        self._initialize(ast_or_source)
+
+    def _initialize(self, ast_or_source: Any):
+        d2c = _import_compiler()
+        if _is_program(ast_or_source):
+            self.program = ast_or_source
+            self.program_raw = None
+            self.source = None
+        elif isinstance(ast_or_source, str):
+            self.source = ast_or_source
+            tokens = d2c.tokenize(ast_or_source)
+            parser = d2c.Parser(tokens)
+            prog_raw = parser.parse()
+            self.program_raw = prog_raw
+            self.program = d2c.expand_macros(prog_raw, parser.macro_table)
+        else:
+            text = str(ast_or_source)
+            self.source = text
+            tokens = d2c.tokenize(text)
+            parser = d2c.Parser(tokens)
+            prog_raw = parser.parse()
+            self.program_raw = prog_raw
+            self.program = d2c.expand_macros(prog_raw, parser.macro_table)
+
+        if not getattr(self.program, 'functions', []):
+            self.fn_index = -1
+            self.stmt_index = -1
+        else:
+            self.fn_index = 0
+            self.stmt_index = 0
+
+    def _functions(self) -> List[Any]:
+        return getattr(self.program, 'functions', []) or []
+
+    def _raw_functions(self) -> List[Any]:
+        return getattr(self.program_raw, 'functions', []) or []
+
+    def _current_fn(self) -> Optional[Any]:
+        fns = self._functions()
+        if 0 <= self.fn_index < len(fns):
+            return fns[self.fn_index]
+        return None
+
+    def _current_stmt(self) -> Optional[Any]:
+        fn = self._current_fn()
+        if not fn:
+            return None
+        body = _get_fn_body(fn)
+        if 0 <= self.stmt_index < len(body):
+            return body[self.stmt_index]
+        return None
+
+    def _print(self, s: str = ''):
+        print(s, flush=True)
+
+    def _print_error(self, msg: str, ex: Optional[BaseException] = None):
+        self._print(f'[error] {msg}')
+        if ex:
+            traceback.print_exc()
+
+    def repl(self):
+        self._print('Density 2 Debugger. Type "help" for commands. "quit" to exit.')
+        while True:
+            try:
+                line = input('(den2) ').strip()
+            except (EOFError, KeyboardInterrupt):
+                self._print()
+                break
+            if not line:
+                continue
+            try:
+                parts = shlex.split(line)
+            except ValueError as ex:
+                self._print_error('Parse error', ex)
+                continue
+            if not parts:
+                continue
+            cmd, *args = parts
+            fn = self.commands.get(cmd.lower())
+            if fn is None:
+                self._print(f'Unknown command: {cmd}. Try "help".')
+                continue
+            try:
+                fn(args)
+            except SystemExit:
+                raise
+            except Exception as ex:
+                self._print_error('Command failed', ex)
+
+    # Commands
+    def cmd_help(self, args: List[str]):
+        lines = [
+            'Commands:',
+            '  help|?                  Show this help.',
+            '  quit|exit               Quit debugger.',
+            '  info                    Show AST summary and cursor.',
+            '  tree [raw|expanded]     Pretty AST (default expanded).',
+            '  funcs                   List functions.',
+            '  use <idx|name>          Select current function.',
+            '  list [count]            List statements from cursor.',
+            '  show [index]            Show statement details.',
+            '  step [n]                Move cursor by n statements.',
+            '  reset                   Reset cursor.',
+            '  dodecagram [raw|expanded]  Show encoding.',
+            '  track on|off [recursive]   Mutation tracking.',
+            '  history [recursive]     Mutation history (compact).',
+            '  walk [ClassName]        Preorder walk (optional type filter).',
+            '  find <regex>            Search values in AST.',
+            '  eval <expr>             Eval in limited env.',
+            '  emit                    Print NASM.',
+            '  write <path>            Write NASM to path.',
+            '  reload [file]           Reload from file.',
+            '  rules                   Show language ruleset summary.',
+            '  dict                    Show dictionary summary.',
+        ]
+        for ln in lines:
+            self._print(ln)
+
+    def cmd_quit(self, args: List[str]):
+        raise SystemExit(0)
+
+    def cmd_info(self, args: List[str]):
+        fns = self._functions()
+        raw_fns = self._raw_functions()
+        self._print(f'File: {self.filename or "<memory>"}')
+        self._print(f'Functions (expanded): {len(fns)} | (raw): {len(raw_fns)}')
+        if self.fn_index >= 0 and self.fn_index < len(fns):
+            fn = fns[self.fn_index]
+            body = _get_fn_body(fn)
+            self._print(f'Cursor: fn[{self.fn_index}]={_get_fn_name(fn)} stmt[{self.stmt_index}] of {len(body)}')
+        else:
+            self._print('Cursor: <no function>')
+
+    def cmd_tree(self, args: List[str]):
+        which = (args[0].lower() if args else 'expanded')
+        if which == 'raw':
+            if self.program_raw is None:
+                self._print('<no raw AST available>')
+                return
+            self._print(_ast_pretty(self.program_raw))
+        else:
+            self._print(_ast_pretty(self.program))
+
+    def cmd_funcs(self, args: List[str]):
+        for i, f in enumerate(self._functions()):
+            self._print(f'[{i}] {_get_fn_name(f)}')
+
+    def cmd_use(self, args: List[str]):
+        if not args:
+            self._print('usage: use <idx|name>')
+            return
+        key = args[0]
+        fns = self._functions()
+        if key.isdigit():
+            idx = int(key)
+            if 0 <= idx < len(fns):
+                self.fn_index = idx
+                self.stmt_index = 0
+                self.cmd_info([])
+            else:
+                self._print('index out of range')
+            return
+        for i, f in enumerate(fns):
+            if _get_fn_name(f) == key:
+                self.fn_index = i
+                self.stmt_index = 0
+                self.cmd_info([])
+                return
+        self._print('function not found')
+
+    def cmd_list(self, args: List[str]):
+        count = int(args[0]) if args and args[0].isdigit() else 10
+        fn = self._current_fn()
+        if not fn:
+            self._print('<no function selected>')
+            return
+        body = _get_fn_body(fn)
+        start = max(0, self.stmt_index)
+        end = min(len(body), start + count)
+        for i in range(start, end):
+            st = body[i]
+            ty = _node_type(st)
+            self._print(f'{i:4}: {ty} {repr(st)}')
+
+    def cmd_show(self, args: List[str]):
+        fn = self._current_fn()
+        if not fn:
+            self._print('<no function selected>')
+            return
+        body = _get_fn_body(fn)
+        idx = self.stmt_index
+        if args and args[0].isdigit():
+            idx = int(args[0])
+        if not (0 <= idx < len(body)):
+            self._print('index out of range')
+            return
+        st = body[idx]
+        self._print(f'[{idx}] type={_node_type(st)}')
+        self._print(_ast_pretty(st))
+
+    def cmd_step(self, args: List[str]):
+        n = int(args[0]) if args and args[0].lstrip('-').isdigit() else 1
+        fn = self._current_fn()
+        if not fn:
+            self._print('<no function selected>')
+            return
+        body = _get_fn_body(fn)
+        self.stmt_index = max(0, min(len(body) - 1, self.stmt_index + n))
+        self.cmd_show([])
+
+    def cmd_reset(self, args: List[str]):
+        self.fn_index = 0 if self._functions() else -1
+        self.stmt_index = 0
+        self.cmd_info([])
+
+    def cmd_dodecagram(self, args: List[str]):
+        which = (args[0].lower() if args else 'expanded')
+        if which == 'raw':
+            if self.program_raw is None:
+                self._print('<no raw AST>')
+            else:
+                self._print(_ast_dodecagram(self.program_raw))
+            return
+        self._print(_ast_dodecagram(self.program))
+
+    def cmd_track(self, args: List[str]):
+        if not args:
+            self._print('usage: track on|off [recursive]')
+            return
+        mode = args[0].lower()
+        recursive = (len(args) > 1 and args[1].lower() in ('1', 'true', 'yes', 'y', 'rec', 'recursive', 'on'))
+        if mode not in ('on', 'off'):
+            self._print('usage: track on|off [recursive]')
+            return
+        _ast_enable_tracking(self.program, enable=(mode == 'on'), recursive=recursive)
+        self._print(f'mutation tracking: {mode} (recursive={recursive})')
+
+    def cmd_history(self, args: List[str]):
+        d2c = _import_compiler()
+        recursive = (len(args) > 0 and args[0].lower() in ('1', 'true', 'yes', 'y', 'rec', 'recursive', 'on'))
+        enc = _ast_encode_history(self.program, recursive=recursive)
+        if enc:
+            self._print('history (compact):')
+            self._print(enc)
+        else:
+            self._print('<no history>')
+
+    def cmd_walk(self, args: List[str]):
+        type_filter = args[0] if args else None
+        def walk(n: Any):
+            w = getattr(n, 'walk', None)
+            if callable(w):
+                for it in w():
+                    yield it
+                return
+            yield n
+        count = 0
+        for node in walk(self.program):
+            if type_filter and _node_type(node) != type_filter:
+                continue
+            self._print(f'{_node_type(node)} | {repr(node)}')
+            count += 1
+            if count > 1000:
+                self._print('... truncated (1000 shown)')
+                break
+
+    def cmd_find(self, args: List[str]):
+        if not args:
+            self._print('usage: find <regex>')
+            return
+        import re
+        pat = re.compile(args[0])
+        def iter_items(n: Any):
+            it = getattr(n, '_iter_fields', None)
+            if callable(it):
+                for k, v in it():
+                    yield k, v
+        hits = 0
+        for node in getattr(self.program, 'walk', lambda: [self.program])():
+            for k, v in (iter_items(node) or []):
+                if isinstance(v, str):
+                    if pat.search(v):
+                        self._print(f'{_node_type(node)}.{k}: {v!r}')
+                        hits += 1
+                elif not hasattr(v, 'walk'):
+                    s = repr(v)
+                    if pat.search(s):
+                        self._print(f'{_node_type(node)}.{k}: {s}')
+                        hits += 1
+        if hits == 0:
+            self._print('<no matches>')
+
+    def cmd_eval(self, args: List[str]):
+        if not args:
+            self._print('usage: eval <expr>')
+            return
+        expr = ' '.join(args)
+        env = {'program': self.program, 'program_raw': self.program_raw, 'fn': self._current_fn(), 'stmt': self._current_stmt(), 'len': len, 'type': type, 'repr': repr, 'str': str}
+        try:
+            out = _safe_eval(expr, env)
+            self._print(repr(out))
+        except Exception as ex:
+            self._print_error('eval failed', ex)
+
+    def cmd_emit(self, args: List[str]):
+        try:
+            d2c = _import_compiler()
+            asm = d2c.generate_nasm(self.program)
+            self._print(asm)
+        except Exception as ex:
+            self._print_error('emit failed', ex)
+
+    def cmd_write(self, args: List[str]):
+        if not args:
+            self._print('usage: write <path>')
+            return
+        path = args[0]
+        try:
+            d2c = _import_compiler()
+            asm = d2c.generate_nasm(self.program)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(asm)
+            self._print(f'written: {path}')
+        except Exception as ex:
+            self._print_error('write failed', ex)
+
+    def cmd_reload(self, args: List[str]):
+        path = args[0] if args else self.filename
+        if not path:
+            self._print('usage: reload <file>')
+            return
+        if not os.path.exists(path):
+            self._print(f'file not found: {path}')
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            self.filename = path
+            self._initialize(text)
+            self._print(f'reloaded: {path}')
+            self.cmd_info([])
+        except Exception as ex:
+            self._print_error('reload failed', ex)
+
+    def cmd_rules(self, args: List[str]):
+        try:
+            d2c = _import_compiler()
+            rs = d2c.get_ruleset()
+            self._print('Ruleset summary:')
+            self._print(f"- tokens: {len(rs.get('tokens', []))}")
+            self._print(f"- keywords: {len(rs.get('keywords', []))}")
+            self._print(f"- inline_languages: {len(rs.get('inline_languages', []))}")
+            self._print(f"- nasm_directives: {len(rs.get('nasm_directives', []))}")
+            self._print(f"- registers_x86_64: {len(rs.get('registers_x86_64', []))}")
+            self._print('Statement syntax:')
+            for k, v in rs.get('statement_syntax', {}).items():
+                self._print(f"  {k}: {v}")
+        except Exception as ex:
+            self._print_error('rules failed', ex)
+
+    def cmd_dict(self, args: List[str]):
+        try:
+            d2c = _import_compiler()
+            di = d2c.get_dictionary()
+            self._print('Dictionary summary:')
+            self._print(f"- syscalls_amd64_linux: {len(di.get('syscalls_amd64_linux', {}))}")
+            self._print(f"- dodecagram entries: {len(di.get('dodecagram', {}))}")
+            self._print(f"- inline_languages: {len(di.get('inline_languages', []))}")
+            self._print(f"- nasm_directives: {len(di.get('nasm_directives', []))}")
+            self._print(f"- registers_x86_64: {len(di.get('registers_x86_64', []))}")
+        except Exception as ex:
+            self._print_error('dict failed', ex)
+
+
+def start_debugger(ast_or_source: Any, filename: Optional[str] = None) -> None:
+    sess = DebugSession(ast_or_source, filename=filename)
+    sess.repl()
+
