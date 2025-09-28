@@ -2202,3 +2202,35 @@ class Parser:
             tok = self.peek()
             if not tok:
                 raise SyntaxError("Unclosed Print: missing ')'")
+            if tok.type == 'STRING':
+                parts.append(tok.value)
+                self.pos += 1
+                first = False
+
+def generate_nasm(ast_or_source: Union[Program, str]) -> str:
+    """
+    Generate NASM assembly.
+    - If given a Program AST, emit NASM via CodeGenerator.
+    - If given Density 2 source (str), parse, expand macros, then emit NASM.
+    - If given an assembly-looking string (already NASM), return as-is.
+    """
+    if isinstance(ast_or_source, Program):
+        gen = CodeGenerator(ast_or_source)
+        return gen.generate()
+
+    if isinstance(ast_or_source, str):
+        text = ast_or_source
+        # Heuristic: looks like NASM already
+        if re.search(r'^\s*section\s+\.text\b', text, flags=re.MULTILINE) and 'global _start' in text:
+            return text
+        # Treat as Density 2 source
+        tokens = tokenize(text)
+        parser = Parser(tokens)
+        program = parser.parse()
+        program = expand_macros(program, parser.macro_table)
+        gen = CodeGenerator(program)
+        return gen.generate()
+
+    raise TypeError(f"generate_nasm expects Program or str, got {type(ast_or_source).__name__}")
+
+class CodeGenerator: ()
