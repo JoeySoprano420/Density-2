@@ -1,0 +1,10 @@
+'''TraceReg(reg)
+#python
+emit("; TraceReg invoked")
+emit(f"mov rsi, {reg}")
+emit("mov rax, 1")        # syscall: write
+emit("mov rdi, 1")        # stdout
+emit("mov rdx, 8")        # bytes to write
+emit("syscall")
+#endpython
+,,,
