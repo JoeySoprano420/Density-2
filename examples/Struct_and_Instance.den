@@ -1,0 +1,9 @@
+struct User {
+    name: String;
+    age: Int;
+}
+
+Main() {
+    u = User("Violet", 27);
+    Print: (u.name + " is " + u.age + " years old.");
+}
