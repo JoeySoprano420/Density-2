@@ -952,6 +952,185 @@ class CodeGenerator:
             except Exception:
                 pass
 
+        def _compile_c_to_asm(self, c_code: str) -> List[str]:
+        # Try tcc, clang, gcc, cl (MSVC) in that order to produce assembly text
+            compiler = None
+        for cand in ('tcc', 'clang', 'gcc', 'cl'):
+            if shutil.which(cand):
+                compiler = cand
+                break
+        if compiler is None:
+            return []
+
+        # MSVC path (use /FA to generate assembly listing)
+        if compiler == 'cl':
+            lines = self._compile_with_msvc(c_code)
+            if lines:
+                # Unobtrusive log of the compiler used
+                return ['; [inline c compiler: cl]'] + lines
+            return []
+
+        tmpdir = tempfile.mkdtemp(prefix='den2_c_')
+        c_path = os.path.join(tmpdir, 'inline.c')
+        asm_path = os.path.join(tmpdir, 'inline.s')
+        try:
+            with open(c_path, 'w', encoding='utf-8') as f:
+                f.write(c_code)
+
+            cmd: List[str]
+            if compiler == 'tcc':
+                # tcc can emit assembly with -S
+                cmd = [compiler, '-nostdlib', '-S', c_path, '-o', asm_path]
+            elif compiler == 'clang':
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+            else:  # gcc
+                cmd = [compiler, '-x', 'c', '-O2', '-S', c_path, '-o', asm_path, '-fno-asynchronous-unwind-tables', '-fomit-frame-pointer']
+
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if not os.path.exists(asm_path):
+                return []
+
+            with open(asm_path, 'r', encoding='utf-8', errors='ignore') as f:
+                raw = f.read()
+
+            # Attempt to translate AT&T/Intel output to NASM
+            translated = self._translate_att_to_nasm(raw)
+            if translated:
+                return [f'; [inline c compiler: {compiler}]'] + translated
+
+            # Fallback to comments if translation failed
+            commented = [f'; [inline c compiler: {compiler}]', '; [begin compiled C assembly]']
+            for line in raw.splitlines():
+                commented.append('; ' + line)
+            commented.append('; [end compiled C assembly]')
+            return commented
+        except Exception as ex:
+            return [f'; [inline c compile error] {ex!r}']
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def _compile_with_msvc(self, c_code: str) -> List[str]:
+        """
+        Use MSVC cl.exe to compile C to assembly listing (.asm via /FA), then translate
+        to NASM-friendly lines.
+        """
+        tmpdir = tempfile.mkdtemp(prefix='den2_msvc_')
+        try:
+            c_path = os.path.join(tmpdir, 'inline.c')
+            with open(c_path, 'w', encoding='utf-8') as f:
+                f.write(c_code)
+
+            # cl will emit inline.asm in the current working directory (tmpdir)
+            cmd = ['cl', '/nologo', '/FA', '/c', os.path.basename(c_path)]
+            proc = subprocess.run(
+                cmd,
+                cwd=tmpdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+
+            asm_listing = os.path.join(tmpdir, 'inline.asm')
+            lines: List[str] = []
+
+            # If cl produced diagnostics, include them as comments (unobtrusive)
+            if proc.stdout:
+                for ln in proc.stdout.splitlines():
+                    if ln.strip():
+                        lines.append('; [cl] ' + ln)
+            if proc.returncode != 0 and proc.stderr:
+                for ln in proc.stderr.splitlines():
+                    if ln.strip():
+                        lines.append('; [cl err] ' + ln)
+
+            if os.path.exists(asm_listing):
+                with open(asm_listing, 'r', encoding='utf-8', errors='ignore') as f:
+                    raw = f.read()
+                translated = self._msvc_asm_to_nasm(raw)
+                # Place translated code after any diagnostics
+                return lines + translated
+
+            # No asm produced; return only diagnostics if any
+            return lines
+        except Exception as ex:
+            return [f'; [inline c compile (msvc) error] {ex!r}']
+        finally:
+            try:
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def _msvc_asm_to_nasm(self, msvc_asm: str) -> List[str]:
+        """
+        Filter MSVC's Intel-style assembly into NASM-friendly output.
+        Best-effort: strip MSVC-specific metadata, map basic directives,
+        preserve labels/instructions/comments.
+        """
+        out: List[str] = []
+        for line in msvc_asm.splitlines():
+            s = line.rstrip()
+            if not s:
+                continue
+
+            # Keep original comments, already ';' prefixed in MSVC listings
+            if s.lstrip().startswith(';'):
+                out.append(s)
+                continue
+
+            tok = s.strip()
+
+            # Skip or rewrite common MSVC metadata/directives
+            upper = tok.upper()
+            if upper.startswith(('TITLE ', 'COMMENT ', 'INCLUDE ', 'INCLUDELIB ')):
+                # Ignore headers/includes in listing
+                continue
+            if upper.startswith(('.MODEL', '.CODE', '.DATA', '.CONST', '.XDATA', '.PDATA', '.STACK', '.LIST', '.686', '.686P', '.XMM', '.X64')):
+                continue
+            if upper.startswith(('PUBLIC ', 'EXTRN ', 'EXTERN ', 'ASSUME ')):
+                continue
+            if upper == 'END':
+                continue
+            if upper.startswith('ALIGN '):
+                # Map to NASM align
+                parts = tok.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    out.append(f'align {parts[1]}')
+                continue
+
+            # PROC/ENDP handling: turn "label PROC" -> "label:" and skip ENDP
+            m_proc = re.match(r'^([A-Za-z_$.@?][\w$.@?]*)\s+PROC\b', tok)
+            if m_proc:
+                out.append(f'{m_proc.group(1)}:')
+                continue
+            if re.match(r'^[A-Za-z_$.@?][\w$.@?]*\s+ENDP\b', tok):
+                # End of procedure: ignore (no epilogue emission here)
+                continue
+
+            # Data directives: DB/DW/DD/DQ -> lowercase NASM-friendly
+            m_data = re.match(r'^(DB|DW|DD|DQ)\b(.*)$', tok, re.IGNORECASE)
+            if m_data:
+                out.append(m_data.group(1).lower() + m_data.group(2))
+                continue
+
+            # Replace "BYTE/WORD/DWORD/QWORD PTR" with NASM "byte/word/dword/qword"
+            tok = re.sub(r'\b(BYTE|WORD|DWORD|QWORD)\s+PTR\b', lambda m: m.group(1).lower(), tok)
+
+            # Replace "OFFSET FLAT:label" or "OFFSET label" with just label
+            tok = re.sub(r'\bOFFSET\s+FLAT:', '', tok, flags=re.IGNORECASE)
+            tok = re.sub(r'\bOFFSET\s+', '', tok, flags=re.IGNORECASE)
+
+            # Some MSVC emits "FLAT:" as a segment label prefix; drop it
+            tok = tok.replace(' FLAT:', ' ')
+
+            # Instructions are already Intel syntax; keep as-is
+            out.append(tok)
+
+        return out
+
     # --- AT&T -> NASM best-effort translation helpers ---
     def _translate_att_to_nasm(self, att_asm: str) -> List[str]:
         out: List[str] = []
@@ -1342,10 +1521,6 @@ emit("mov rdi, 1")
 
     print("\nThen execute with:")
     print("  ./out")
-
-    print("\nTo assemble and link (Linux x86-64), run:")
-    print("  nasm -f elf64 out.asm -o out.o")
-    print("  ld out.o -o out")
 
     print("\nTo assemble and link (Windows x86-64), run:")
     print("  nasm -f pe64 out.asm -o out.o")
