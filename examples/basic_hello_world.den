@@ -1,0 +1,3 @@
+Main() {
+    Print: ("Hello, Density 2!");
+}
