@@ -1,0 +1,9 @@
+Main() {
+    #python
+    emit("mov rax, 1")
+    emit("mov rdi, 1")
+    emit("mov rsi, str_0")
+    emit("mov rdx, 14")
+    emit("syscall")
+    #endpython
+}
