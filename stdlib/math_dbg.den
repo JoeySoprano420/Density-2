@@ -1,1 +1,18 @@
+'''AssertEq(a, b)
+#python
+emit(f"mov rax, {a}")
+emit(f"cmp rax, {b}")
+emit("jne assert_fail")
+emit("; passed")
+emit("jmp assert_end")
+emit("assert_fail:")
+emit("mov rdi, str_fail")
+emit("call print_string")
+emit("assert_end:")
+#endpython
+,,,
+
+'''Trace(msg)
+Print: (msg);
+,,,
 
