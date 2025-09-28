@@ -1,0 +1,55 @@
+'''Add(a, b)
+#python
+emit(f"mov rax, {a}")
+emit(f"add rax, {b}")
+#endpython
+,,,
+
+'''Subtract(a, b)
+#python
+emit(f"mov rax, {a}")
+emit(f"sub rax, {b}")
+#endpython
+,,,
+
+'''Multiply(a, b)
+#python
+emit(f"mov rax, {a}")
+emit(f"mov rbx, {b}")
+emit("imul rax, rbx")
+#endpython
+,,,
+
+'''Divide(a, b)
+#python
+emit(f"mov rax, {a}")
+emit("cqo")  # sign-extend rax into rdx:rax
+emit(f"mov rbx, {b}")
+emit("idiv rbx")
+#endpython
+,,,
+
+'''Modulus(a, b)
+#python
+emit(f"mov rax, {a}")
+emit("cqo")
+emit(f"mov rbx, {b}")
+emit("idiv rbx")
+emit("; result in rdx")
+#endpython
+,,,
+
+'''Power(base, exp)
+#python
+emit("mov rax, 1")
+emit(f"mov rcx, {exp}")
+emit(f"mov rbx, {base}")
+emit("pow_loop:")
+emit("test rcx, rcx")
+emit("jz pow_done")
+emit("imul rax, rbx")
+emit("dec rcx")
+emit("jmp pow_loop")
+emit("pow_done:")
+#endpython
+,,,
