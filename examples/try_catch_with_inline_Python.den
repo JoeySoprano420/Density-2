@@ -1,0 +1,9 @@
+Main() {
+    try {
+        #python
+        raise Exception("Something went wrong")
+        #endpython
+    } catch (Error e) {
+        Print: ("Caught error: " + e);
+    }
+}
