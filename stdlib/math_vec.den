@@ -1,1 +1,28 @@
+'''VecAdd(xmm1, xmm2)
+#asm
+    movaps xmm0, xmm1
+    addps xmm0, xmm2
+#endasm
+,,,
+
+'''VecSub(xmm1, xmm2)
+#asm
+    movaps xmm0, xmm1
+    subps xmm0, xmm2
+#endasm
+,,,
+
+'''VecMul(xmm1, xmm2)
+#asm
+    movaps xmm0, xmm1
+    mulps xmm0, xmm2
+#endasm
+,,,
+
+'''VecDiv(xmm1, xmm2)
+#asm
+    movaps xmm0, xmm1
+    divps xmm0, xmm2
+#endasm
+,,,
 
