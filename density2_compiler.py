@@ -4210,6 +4210,164 @@ class CodeGenerator:
         self._reg_cache = {'rax_sys_write': False, 'rdi_stdout': False}
         self._locals: Dict[str, Dict[str, str]] = {}  # funcName -> {varName -> label}
 
+        # --- inside the last CodeGenerator class ---
+
+def _emit_stmt(self, func: Function, st: Statement, end_label: str):
+    if isinstance(st, PrintStatement):
+        self._emit_print(st.text)
+        return
+    if isinstance(st, InlineBlock):
+        # pass end_label so 'ret' in inline code jumps to function end
+        self._emit_inline(st, end_label)
+        self._invalidate_reg_cache()
+        return
+    if isinstance(st, VariableDecl):
+        # init handled at function entry
+        return
+    if isinstance(st, Assign):
+        self._emit_expr(func, st.expr)
+        var_label = self._locals[func.name].get(st.name)
+        if var_label is None:
+            var_label = self._declare_implicit(func, st.name)
+        self.text_lines.append(f'    mov [{var_label}], rax')
+        return
+    if isinstance(st, ExprStatement):
+        self._emit_expr(func, st.expr)  # result in rax, ignored
+        return
+    if isinstance(st, IfStatement):
+        else_lbl = self._new_label('else')
+        end_if = self._new_label('endif')
+        self._emit_expr(func, st.cond)
+        self.text_lines.append('    cmp rax, 0')
+        self.text_lines.append(f'    je {else_lbl}')
+        for ss in st.then_body:
+            self._emit_stmt(func, ss, end_label)
+        self.text_lines.append(f'    jmp {end_if}')
+        self.text_lines.append(f'{else_lbl}:')
+        for ss in st.else_body:
+            self._emit_stmt(func, ss, end_label)
+        self.text_lines.append(f'{end_if}:')
+        return
+    if isinstance(st, WhileStatement):
+        top = self._new_label('while_top')
+        done = self._new_label('while_end')
+        self.text_lines.append(f'{top}:')
+        self._emit_expr(func, st.cond)
+        self.text_lines.append('    cmp rax, 0')
+        self.text_lines.append(f'    je {done}')
+        for ss in st.body:
+            self._emit_stmt(func, ss, end_label)
+        self.text_lines.append(f'    jmp {top}')
+        self.text_lines.append(f'{done}:')
+        return
+    if isinstance(st, ForStatement):
+        top = self._new_label('for_top')
+        done = self._new_label('for_end')
+        if st.init:
+            self._emit_stmt(func, st.init, end_label)
+        self.text_lines.append(f'{top}:')
+        if st.cond:
+            self._emit_expr(func, st.cond)
+            self.text_lines.append('    cmp rax, 0')
+            self.text_lines.append(f'    je {done}')
+        for ss in st.body:
+            self._emit_stmt(func, ss, end_label)
+        if st.post:
+            self._emit_stmt(func, st.post, end_label)
+        self.text_lines.append(f'    jmp {top}')
+        self.text_lines.append(f'{done}:')
+        return
+    if isinstance(st, ReturnStatement):
+        # For Main, return exits with code; for others, just jump to end
+        if st.value is not None:
+            self._emit_expr(func, st.value)
+        else:
+            self.text_lines.append('    xor rax, rax')
+        if func.name == 'Main':
+            self.text_lines.append('    mov rdi, rax')
+        self.text_lines.append(f'    jmp {end_label}')
+        return
+    if isinstance(st, CIAMBlock) or isinstance(st, MacroCall):
+        self.text_lines.append('    ; macro artifacts should be expanded away')
+        return
+    self.text_lines.append('    ; Unknown statement')
+
+def _sanitize_inline_lines(self, lines: List[str], end_label: Optional[str]) -> List[str]:
+    """
+    Make inline code robust:
+    - Drop sections/globals/external directives/comments not needed.
+    - Strip common prologues/epilogues (push rbp/mov rbp,rsp/leave/pop rbp).
+    - Rewrite 'ret' to 'jmp end_label' to safely transition to function tail.
+    - Keep labels and instructions; keep comment lines.
+    """
+    out: List[str] = []
+    drop_prefixes = (
+        'section', 'global', 'extern', 'align', 'ALIGN',
+        '.globl', '.global', '.type', '.size', '.ident', '.file', '.cfi'
+    )
+    prologue = (
+        'push rbp', 'mov rbp, rsp', 'mov rbp,rsp',
+    )
+    epilogue = (
+        'pop rbp', 'leave',
+    )
+    for raw in lines:
+        line = raw.rstrip('\n')
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith((';', '#')):  # keep comments
+            out.append(s)
+            continue
+        low = s.lower()
+        if any(s.startswith(p) for p in drop_prefixes):
+            continue
+        if low.endswith(':'):  # label
+            out.append(s)
+            continue
+        if any(low.startswith(p) for p in prologue):
+            continue
+        if any(low.startswith(p) for p in epilogue):
+            continue
+        if re.match(r'^\s*ret(q)?\b', s, flags=re.IGNORECASE):
+            if end_label:
+                out.append(f'jmp {end_label}')
+            # if no end_label provided, drop the ret to avoid terminating the process unexpectedly
+            continue
+        # MSVC listing data directives mapping already handled upstream; keep instruction
+        out.append(s)
+    return out
+
+def _emit_inline(self, block: InlineBlock, end_label: Optional[str] = None):
+    if block.lang == 'asm':
+        self.text_lines.append('    ; inline NASM start')
+        raw_lines = [ln.rstrip() for ln in block.content.splitlines()]
+        for ln in self._sanitize_inline_lines(raw_lines, end_label):
+            if ln:
+                self.text_lines.append('    ' + ln)
+        self.text_lines.append('    ; inline NASM end')
+    elif block.lang in ('py', 'python'):
+        self.text_lines.append('    ; inline Python start')
+        py_lines = self._run_inline_python(block.content)
+        for ln in self._sanitize_inline_lines(py_lines, end_label):
+            self.text_lines.append('    ' + ln)
+        self.text_lines.append('    ; inline Python end')
+    elif block.lang == 'c':
+        self.text_lines.append('    ; inline C start')
+        asm_lines = self._compile_c_to_asm(block.content)
+        if asm_lines:
+            # sanitize compiler output for safe inlining
+            for ln in self._sanitize_inline_lines(asm_lines, end_label):
+                self.text_lines.append('    ' + ln)
+        else:
+            for line in block.content.splitlines():
+                self.text_lines.append('    ; ' + line)
+            self.text_lines.append('    ; (no C compiler found; block left as comment)')
+        self.text_lines.append('    ; inline C end')
+    else:
+        for line in block.content.splitlines():
+            self.text_lines.append(f'    ; inline {block.lang} ignored: {line}')
+
     def generate(self) -> str:
         self.text_lines = []
         self.data_lines = []
