@@ -1,0 +1,7 @@
+'''Greet(name)
+Print: ("Greetings, " + name + "!");
+,,,
+
+Main() {
+    Greet("Joseph");
+}
