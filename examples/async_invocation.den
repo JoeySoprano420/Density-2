@@ -1,0 +1,7 @@
+async Worker() {
+    Print: ("Running in parallel!");
+}
+
+Main() {
+    Worker();
+}
