@@ -1514,5 +1514,253 @@ Inline NASM: injected literally into .text.
 
 
 
+
+---
+
+# 📘 Density 2 Compiler — Capabilities Dossier
+
+*A complete overview of the features, powers, and ecosystem of the Density 2 Compiler, drawn from its implementation and behavior.*
+
+---
+
+## 🔹 1. Core Identity
+
+* **Language:** Density 2 (`.den` files)
+* **Execution:** Ahead-of-Time (AOT) compilation
+* **Target Backends:** NASM → ELF (Linux), PE (Windows), Mach-O (macOS)
+* **AST Encoding:** Dodecagrams (base-12 digits `0-9,a,b`)
+* **Philosophy:** “Terms and signs mutually universal” — instantly legible to Python, C, and NASM programmers.
+
+---
+
+## 🔹 2. Lexical Analysis
+
+The **Lexer** processes `.den` source into tokens with high granularity. It recognizes:
+
+* **Keywords & Identifiers**
+* **Print statements** → `Print:("…")`
+* **CIAM macros** → `'''Macro … ,,,`
+* **Inline foreign code** → `#asm`, `#c`, `#python`, `#endasm`, etc.
+* **Comments:**
+
+  * Single-line → `//`
+  * Multi-line → `/* … */`
+* **Strings** → `"Hello"`
+* **Operators & Delimiters** → braces, colons, semicolons, commas, plus signs
+
+---
+
+## 🔹 3. Abstract Syntax Tree (AST)
+
+### Node Types
+
+* **Program** — root of the AST
+* **Function** — e.g. `Main()`
+* **Statements:**
+
+  * `PrintStatement("Hello")`
+  * `CIAMBlock(name, params, body_text)`
+  * `MacroCall(name, args)`
+  * `InlineBlock(lang, content)`
+
+### Utilities
+
+* Walkable with `.children()` and `.walk()`
+* `pretty()` → indented dump
+* Dodecagram encoding → `ast_to_dodecagram()`
+* **Mutation History** → logs all AST changes, encodable into compact strings
+
+---
+
+## 🔹 4. Parsing
+
+The parser is **Density-aware** and translates tokens into AST nodes:
+
+* Functions (`Main() { … }`)
+* Print statements with concatenation (`"Hello " + name`)
+* CIAM macro definitions (added to macro table)
+* Macro calls → expanded inline
+* Inline blocks → `#asm`, `#c`, `#python`
+
+---
+
+## 🔹 5. Macro System (CIAMs)
+
+**Contextually Inferred Abstraction Macros (CIAMs)** are **first-class compile-time features**.
+
+* Syntax:
+
+  ```density2
+  '''SayHello(name)
+      Print:("Hello, " + name + "!");
+  ,,,
+  ```
+* Stored in `macro_table`
+* Expanded recursively with parameter substitution
+* Prevents infinite recursion with depth checks
+* Re-parses expanded body into new AST nodes
+
+✅ *Effect:* Compile-time metaprogramming without runtime overhead.
+
+---
+
+## 🔹 6. Inline Foreign Code
+
+The compiler natively embeds foreign code:
+
+* **#asm**
+
+  * Inserts NASM literally into `.text`
+* **#c**
+
+  * Compiles C snippets via `tcc`, `clang`, `gcc`, or `cl.exe`
+  * Converts AT&T syntax to NASM automatically
+* **#python**
+
+  * Executes Python at compile-time
+  * Inline Python can emit NASM via `emit("…")`
+
+Unknown languages → preserved as comments.
+
+---
+
+## 🔹 7. Code Generation
+
+Generates **real NASM assembly**:
+
+### Data Section
+
+* String table with labels → `db "Hello, World!", 10, 0`
+
+### Text Section
+
+* `_start:` entry point
+* Syscalls:
+
+  * `sys_write` → for `Print`
+  * `sys_exit` → graceful termination
+* Register optimizations (reuse `rax`, `rdi`)
+* Inline blocks spliced directly into `.text`
+
+Example output:
+
+```asm
+section .data
+    str_0 db "Hello, World!", 10, 0
+section .text
+    global _start
+_start:
+    mov rax, 1
+    mov rdi, 1
+    mov rsi, str_0
+    mov rdx, 14
+    syscall
+    mov rax, 60
+    xor rdi, rdi
+    syscall
+```
+
+---
+
+## 🔹 8. Cross-Platform Backends
+
+* **Linux:** ELF64 output via NASM + ld
+* **Windows:** PE64 output via NASM + MSVC `link.exe` / `lld-link`
+* **macOS:** Mach-O output via NASM + `ld64`
+
+✅ Single compiler → multi-OS binaries.
+
+---
+
+## 🔹 9. Debugging & History
+
+* **Mutation Tracking** → every AST transformation recorded
+* Encodable into **Dodecagram history strings** (compact base-12 logs)
+* Useful for **debugging, reproducibility, and replaying compiler decisions**
+
+---
+
+## 🔹 10. Error Handling & Resilience
+
+* Inline Python errors caught gracefully → NASM output preserved
+* C compilation failures → inline code converted to comments instead of crashing
+* Prevents infinite macro recursion
+* Safe fallback when foreign code is unsupported
+
+---
+
+## 🔹 11. Developer Experience
+
+### CLI Workflow
+
+```bash
+python density2_compiler.py hello.den
+nasm -f elf64 out.asm -o out.o
+ld out.o -o hello
+./hello
+```
+
+### Sample Output
+
+```
+Hello, World!
+```
+
+### Example with CIAM + Inline ASM
+
+```density2
+Main() {
+    '''SayHello(name)
+        Print: ("Hello, " + name + "!");
+    ,,,
+    SayHello("Density 2");
+    #asm
+        mov rax, 60
+        xor rdi, rdi
+        syscall
+    #endasm
+}
+```
+
+---
+
+## 🔹 12. Security & Safety
+
+* Explicit memory + syscalls
+* No garbage collector overhead
+* Inline ASM/C/Python **sandboxed into compile-time or explicit blocks**
+* Safe defaults (errors → comments, not crashes)
+
+---
+
+## 🔹 13. Unique Advantages
+
+* **Trilingual fluency**: speaks Python, C, and NASM inline
+* **Compile-time macros** → zero runtime penalty
+* **Universal semantics** → 1-to-1 keyword alignment with existing languages
+* **Cross-OS executables** from the same `.den` source
+* **AST history + Dodecagram encoding** → unprecedented transparency
+
+---
+
+## 🏆 In Summary
+
+The **Density 2 Compiler** is not a toy — it is a **full professional toolchain** that:
+
+1. Reads Density 2 code →
+2. Builds AST with macro expansion →
+3. Generates **real NASM** →
+4. Assembles + links →
+5. Produces **native executables** on Linux, Windows, and macOS.
+
+It **bridges scripting, systems programming, and assembly** in a way no other compiler does.
+
+---
+
+
+## -----
+
+
+
 This gives you a real end-to-end pipeline: Density 2 .den file → AST → .asm → executable.
 
