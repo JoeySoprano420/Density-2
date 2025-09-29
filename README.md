@@ -1,6 +1,6 @@
 # Density-2
 
-*density2_compiler.py not density2c*
+*density2_compiler.py not density2c* unless you use the installer*
 
 ---
 
@@ -1757,10 +1757,164 @@ It **bridges scripting, systems programming, and assembly** in a way no other co
 
 ---
 
+## -----
+
+This gives you a real end-to-end pipeline: Density 2 .den file → AST → .asm → executable.
 
 ## -----
 
 
+* HOW TO USE*
 
-This gives you a real end-to-end pipeline: Density 2 .den file → AST → .asm → executable.
+  Here’s a step-by-step “Getting Started” guide for Windows based on everything the Density-2 README lays out. It walks you from zero to running your first .den program the same day:
+
+⸻
+
+🟣 1. Download Density 2 for Windows
+	1.	Go to the official repo: https://github.com/JoeySoprano420/Density-2
+	2.	In the “Releases” section, look for the latest Windows build:
+	•	Density2-x64-setup.exe (installer)
+	•	or download the source:
+
+git clone https://github.com/JoeySoprano420/Density-2.git
+cd Density-2
+
+
+(The installer already includes the compiler, standard libraries, and examples. Cloning lets you run density2_compiler.py directly.)
+
+⸻
+
+🟣 2. Install Prerequisites
+
+Density 2 emits real NASM assembly and links it into executables. On Windows you need:
+	•	Python 3.10+ (for the compiler front-end and inline #python blocks)
+Download from python.org and tick “Add Python to PATH.”
+	•	NASM 2.15+ (assembler)
+Download NASM for Windows and add its folder to PATH.
+	•	Linker
+Either:
+	•	MSVC link.exe (comes with Visual Studio Build Tools / VS Community Edition), or
+	•	LLVM’s lld-link (from LLVM for Windows).
+
+Optional but useful:
+	•	PowerShell 5.1+ for running the examples.
+	•	Windows SDK for PE linking headers.
+	•	WSL2 if you also want to produce ELF Linux binaries from Windows.
+
+⸻
+
+🟣 3. Run the Installer (or set up manually)
+
+Using the Installer
+
+Double-click Density2-x64-setup.exe. It:
+	•	Installs density2_compiler.py to C:\Program Files\Density2\bin.
+	•	Adds density2c.exe to PATH so you can type density2c from anywhere.
+
+Verify installation:
+
+density2c --version
+
+You should see:
+
+Density 2 Compiler v2.0.0
+Backend: NASM 2.15 / PE64
+
+Using the Source Directly
+
+If you cloned the repo, just use:
+
+python density2_compiler.py --help
+
+to run the compiler front-end.
+
+⸻
+
+🟣 4. Create Your First Program
+
+Make a file hello.den:
+
+// Density 2 Hello World Program
+Main() {
+    Print:("Hello, Density 2!");
+}
+
+Compile and run it:
+
+density2c hello.den -o hello.exe
+.\hello.exe
+
+or, if you’re using the Python front-end directly:
+
+python density2_compiler.py hello.den
+nasm -f win64 out.asm -o out.obj
+link /SUBSYSTEM:CONSOLE out.obj /OUT:hello.exe
+.\hello.exe
+
+You should see:
+
+Hello, Density 2!
+
+
+⸻
+
+🟣 5. Try Quick Wins
+
+CIAM (Compile-time Macro)
+
+'''Square(x)
+    Print:(x * x);
+,,,
+
+Main() {
+    Square(12);
+}
+
+Compile/run the same way and it prints 144.
+
+Inline Assembly
+
+Main() {
+    #asm
+        mov rax, 60
+        xor rdi, rdi
+        syscall
+    #endasm
+}
+
+This injects raw NASM right into the program.
+
+Inline Python
+
+Main() {
+    #python
+        print("Hello from Python!")
+    #endpython
+}
+
+This executes Python at compile time and can even emit assembly via emit("…").
+
+⸻
+
+🟣 6. Keep the Reference Handy
+
+Density 2 keywords (memory: alloc, free, error flow: try, catch, throws, flag, control flow: if, for, while, etc.) are listed in the README’s Reference Lookup Table. Pin it or print the cheat sheet so you can code without flipping back and forth.
+
+⸻
+
+🟣 7. Workarounds on Windows
+
+Problem	Quick Fix
+“NASM not found”	Install NASM and add it to PATH.
+“link.exe not found”	Install Visual Studio Build Tools.
+Inline Python fails	Check Python 3.10+ in PATH.
+Segfault in inline ASM	Check register usage, proper syscall conventions.
+Need static typing	Use intrinsic static annotations.
+
+
+⸻
+
+With those steps you can download, install, compile, and run your first Density 2 program on Windows today.
+
+## -----
 
