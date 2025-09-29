@@ -4,7 +4,7 @@
 
 ---
 
-# 🌌 Density 2: A Language Manifesto
+# 🌌 Density 2: Density 2 is a symbolic evolution of Assembly—it doesn’t abstract away the machine, it speaks to it in ceremony.
 
 ---
 
