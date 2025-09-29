@@ -4,7 +4,11 @@
 
 ---
 
-# 🌌 Density 2: Density 2 is a symbolic evolution of Assembly—it doesn’t abstract away the machine, it speaks to it in ceremony.
+# 🌌 Density 2 is like advanced Assembly with templates.
+It gives you direct control over the computer’s hardware, just like Assembly, but lets you write code using reusable patterns and macros. Instead of typing out every instruction by hand, you can define shortcuts that expand into full blocks of low-level code.
+
+The AI doesn’t follow fixed scripts—it adapts.
+Instead of using hardcoded decisions, the AI responds based on traits and patterns. That means it can change its behavior depending on what’s happening in the game, making each match feel more dynamic and less predictable.
 
 ---
 
