@@ -4726,3 +4726,10 @@ def _emit_inline(self, block: InlineBlock, end_label: Optional[str] = None):
             if s.endswith(':'):
                 out.append(s)
                 continue
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == '--version':
+        print("Density 2 Compiler v2.0.0\nBackend: NASM 2.15 / PE64")
+        sys.exit(0)
+    # otherwise normal compile path…
