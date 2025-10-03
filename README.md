@@ -1996,3 +1996,120 @@ Windows Installer integration (Inno Setup)
 You already have an Inno Setup script (setup.iss) for Density-2; append these Candy Wrapper additions so it installs alongside Density-2 and adds file-type actions. (If you prefer a separate installer, this block can be its own .iss.) (refer to setup.iss)
 
 
+Usage
+# From any folder (after install)
+candy file.asm        # assemble, link, run
+candy file.obj        # link, run
+candy program.den     # use Density-2 to emit asm/obj/exe, then run
+
+
+Flags:
+
+candy file.asm --keep  # keep temp build folder for inspection
+
+Extending beyond Density-2
+
+Candy Wrapper’s frontend hook is in try_density2_frontend(). To add other languages, mirror that pattern:
+
+detect its compiler,
+
+ask it to emit .asm (preferred) or .obj,
+
+then reuse the same NASM/linker steps.
+
+Notes, gotchas, safety
+
+Run from a Developer Prompt (MSVC) or an LLVM/MinGW-configured shell so link.exe/lld-link/gcc and Windows SDK libs are reachable.
+
+Security: Running untrusted .asm/.obj is equivalent to running an unknown .exe. Only execute code you trust.
+
+Density-2 expectations: The README states Density-2 emits NASM and can assemble to PE; Candy uses that behavior. If your compiler’s CLI flags differ, Candy’s Density-2 probe tries both density2c and python density2_compiler.py and then searches for .exe/.asm/.obj artifacts next to the .den.
+
+
+Build it: (.spec file)
+
+pyinstaller CandyWrapper.spec
+
+
+
+Install PyInstaller (only once):
+
+pip install pyinstaller
+
+
+You can copy that .exe into bin\ next to your other tools. It already bundles Python, so you don’t need Python installed.
+
+
+Now when you build your installer:
+
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
+
+
+…it will package CandyWrapper.exe and install it alongside your Density-2 compiler. Users can:
+
+Double-click .asm, .obj, or .den files to run instantly.
+
+Right-click “Run with Candy Wrapper.”
+
+Call CandyWrapper.exe myfile.asm from any shell.
+
+
+GUI Option
+
+If you like the candy_gui.py drag-and-drop window, freeze that as a separate EXE with PyInstaller:
+
+pyinstaller --onefile --windowed candy_gui.py
+
+
+Ship that as CandyWrapperGUI.exe and add it to your installer under [Files] + [Icons].
+
+
+After installing, .asm / .obj / .den double-click → runs instantly.
+
+No Python needed.
+
+Works wherever MSVC or LLVM or MinGW is available.
+
+Native Density-2 integration but plans are to extended by adding new front-ends in candywrapper.py.
+
+
+here’s the simplest way to turn your candywrapper.py into a single-file CandyWrapper.exe without even writing a spec file yourself.
+
+One-liner PyInstaller build
+
+From the folder where candywrapper.py lives:
+
+pip install pyinstaller  # only first time
+pyinstaller --onefile --console --name CandyWrapper candywrapper.py
+
+
+--onefile = bundle everything into one EXE.
+
+--console = leave a console window open (handy for assembly output).
+
+--name CandyWrapper = final exe name.
+
+PyInstaller will create:
+
+dist\CandyWrapper.exe
+
+
+Copy dist\CandyWrapper.exe into bin\ in your repo and update setup.iss to ship it.
+
+Optional: GUI version
+
+If you also want a drag-and-drop window without a console, just point at the GUI script:
+
+pyinstaller --onefile --windowed --name CandyWrapperGUI candy_gui.py
+
+
+PyInstaller will create:
+
+dist\CandyWrapperGUI.exe
+
+
+Ship that as well; your Inno Setup [Files] can include both EXEs.
+
+After you run one of those commands, you’re done — no Python needed on the target machine. Users can double-click .asm, .obj or .den files and Candy Wrapper instantly assembles, links, and runs them.
+
+
