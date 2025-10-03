@@ -1922,3 +1922,67 @@ With those steps you can download, install, compile, and run your first Density 
 
 ## -----
 
+Name: Candy Wrapper
+
+What it does: Double-click (or candy <file>) any .asm (NASM) or .obj and it will wrap → link → run as a real .exe on Windows.
+
+Native Density-2 support: If you pass a .den file, Candy Wrapper will invoke your Density-2 toolchain to emit assembly, then finish the wrap→link→run pipeline.
+
+Extensible: clean plugin points so you can register other language frontends later.
+
+I read your repo root (and saw the exact files you referenced are present) and the README’s declared capabilities that Density-2 emits NASM and assembles to real PE executables—so Candy Wrapper integrates around that pipeline. 
+GitHub
+ 
+GitHub
+
+Quickstart (Windows, x64)
+
+Prereqs (any one of these linkers will do):
+
+MSVC (Developer Command Prompt has link.exe + Windows SDK libs in PATH), or
+
+LLVM (has lld-link and SDK libs set up), or
+
+MinGW-w64 (if you prefer gcc to drive linking; optional fallback).
+
+Also install NASM (nasm in PATH).
+
+Save the files below (exact names/paths shown).
+
+Open Developer PowerShell for VS (or a shell where your linker + SDK libs are on PATH).
+
+Run:
+
+candy hello.asm
+candy somefile.obj
+candy sample.den
+
+
+Candy Wrapper will produce a temp .exe and run it immediately.
+
+
+What makes this “instant” & robust
+
+.asm → .obj → .exe in one go (NASM + best-available linker).
+
+.obj → .exe auto-link with smart entrypoint detection. If your object exposes main but lacks a Windows entrypoint, Candy auto-synthesizes a tiny stub that calls main then ExitProcess, and links both together.
+
+Density-2 native path: if density2c is installed, Candy uses it; otherwise it tries python density2_compiler.py from common install locations, then continues the wrap/link/run.
+
+The repo lists density2_compiler.py, density2c.bat, and setup.iss, and the README explicitly says Density-2 emits NASM and assembles to real PE executables; Candy Wrapper relies on exactly that behavior. 
+GitHub
+
+2) One-liner launcher (PATH shim)
+
+Save as: C:\Program Files\CandyWrapper\bin\candy.bat
+
+@echo off
+REM Candy Wrapper launcher
+setlocal
+python "%~dp0candywrapper.py" %*
+endlocal
+
+
+(If you freeze to an EXE, this isn’t needed.)
+
+
