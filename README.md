@@ -1986,3 +1986,13 @@ endlocal
 (If you freeze to an EXE, this isn’t needed.)
 
 
+Optional GUI (drag-and-drop)
+
+Save as (optional): C:\Program Files\CandyWrapper\bin\candy_gui.py
+
+
+Windows Installer integration (Inno Setup)
+
+You already have an Inno Setup script (setup.iss) for Density-2; append these Candy Wrapper additions so it installs alongside Density-2 and adds file-type actions. (If you prefer a separate installer, this block can be its own .iss.) (refer to setup.iss)
+
+
