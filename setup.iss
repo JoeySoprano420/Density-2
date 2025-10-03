@@ -67,3 +67,30 @@ Name: "{group}\Candy Wrapper"; Filename: "{app}\bin\candy.bat"
 Name: "{group}\Candy Wrapper GUI"; Filename: "{app}\bin\candy_gui.py"; Parameters: ""; WorkingDir: "{app}\bin"; Tasks:
 
 
+; --- Candy Wrapper additions ---
+[Files]
+Source: "dist\CandyWrapper\CandyWrapper.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+
+[Tasks]
+Name: "addpath_candy"; Description: "Add Candy Wrapper to PATH"; Flags: checkedonce
+
+[Registry]
+; PATH extension
+Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+    ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Tasks: addpath_candy; Flags: preservestringtype
+
+; Context menu + file associations
+Root: HKCU; Subkey: "Software\Classes\*\shell\Run with Candy Wrapper"; ValueType: string; ValueData: "Run with Candy Wrapper"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\*\shell\Run with Candy Wrapper\command";
+    ValueType: string; ValueData: """{app}\bin\CandyWrapper.exe"" ""%1"""; Flags: uninsdeletekey
+
+Root: HKCU; Subkey: "Software\Classes\.asm\shell\open\command";
+    ValueType: string; ValueData: """{app}\bin\CandyWrapper.exe"" ""%1"""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.obj\shell\open\command";
+    ValueType: string; ValueData: """{app}\bin\CandyWrapper.exe"" ""%1"""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.den\shell\open\command";
+    ValueType: string; ValueData: """{app}\bin\CandyWrapper.exe"" ""%1"""; Flags: uninsdeletevalue
+
+[Icons]
+Name: "{group}\Candy Wrapper"; Filename: "{app}\bin\CandyWrapper.exe"
+
