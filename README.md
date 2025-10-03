@@ -2113,3 +2113,93 @@ Ship that as well; your Inno Setup [Files] can include both EXEs.
 After you run one of those commands, you’re done — no Python needed on the target machine. Users can double-click .asm, .obj or .den files and Candy Wrapper instantly assembles, links, and runs them.
 
 
+🎉 Candy Wrapper v1.0.0 Release
+
+We are proud to announce the first full release of Candy Wrapper — a Virtual User Interface Environment designed to instantly run low-level code with zero hassle.
+
+🚀 What’s New
+🔹 Instant Execution
+
+Run .asm (NASM) or .obj files directly — Candy Wrapper wraps, links, and executes them as real .exe binaries automatically.
+
+Double-click a file or call CandyWrapper.exe myfile.asm from any shell.
+
+🔹 Density-2 Native Support
+
+Candy Wrapper integrates directly with the Density-2 toolchain.
+
+.den files are compiled through Density-2 → NASM → PE/COFF .exe and run instantly.
+
+Seamless use of both density2c and density2_compiler.py backends.
+
+🔹 Auto-Linking Logic
+
+Smart detection of entrypoints (main, _start) with fallbacks.
+
+Automatic stub generation if only main is defined.
+
+Works with MSVC link.exe, LLVM lld-link, or MinGW gcc.
+
+🔹 Self-Contained Executable
+
+Candy Wrapper is now distributed as a single .exe (built with PyInstaller).
+
+No Python required on the user’s system.
+
+Lightweight, portable, and installer-ready.
+
+🔹 GUI Option
+
+Optional Candy Wrapper GUI (CandyWrapperGUI.exe) for drag-and-drop execution.
+
+Friendly window interface with browse support.
+
+🔹 Installer Integration
+
+Updated Inno Setup installer (setup.iss) includes Candy Wrapper.
+
+PATH integration and context menus:
+
+Right-click → “Run with Candy Wrapper”
+
+Double-click .asm / .obj / .den files → executes instantly.
+
+🛠 Requirements
+
+Windows 10/11 (x64).
+
+At least one linker available:
+
+MSVC (link.exe) with Windows SDK, OR
+
+LLVM (lld-link), OR
+
+MinGW-w64 (gcc).
+
+NASM (nasm) in PATH.
+
+📦 Installation
+
+Download and run the latest CandyWrapper-x64-setup.exe.
+
+During install, choose “Add Candy Wrapper to PATH”.
+
+Right-click or double-click your .asm, .obj, or .den files — instant execution!
+
+💡 Example Usage
+CandyWrapper hello.asm
+CandyWrapper utils.obj
+CandyWrapper demo.den
+
+🔮 Roadmap
+
+Extensible plugin system for additional language frontends.
+
+More cross-platform targets (Linux ELF / macOS Mach-O).
+
+Integrated build logs and debugger hooks.
+
+
+## -----
+
+
