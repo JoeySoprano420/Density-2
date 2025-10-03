@@ -2203,3 +2203,93 @@ Integrated build logs and debugger hooks.
 ## -----
 
 
+SUMMARY OF ADDITIONS:
+
+🎁 Candy Wrapper v1.0.0
+
+The very first public release of Candy Wrapper — a Virtual User Interface Environment that instantly runs .asm (NASM), .obj, and Density-2 .den files by wrapping them into real Windows .exe executables.
+
+📥 Download
+
+⬇️ CandyWrapper-x64-setup.exe
+
+⬇️ CandyWrapper.exe (standalone)
+
+⬇️ CandyWrapperGUI.exe (drag-and-drop interface)
+
+(All builds are code-signed and portable. The installer integrates Candy Wrapper into PATH and context menus.)
+
+✨ Features
+
+Instant execution: Run .asm and .obj files directly, automatically assembled, linked, and executed.
+
+Native Density-2 support: .den files compile through Density-2 → NASM → .exe without manual steps.
+
+Smart auto-linking: Detects main or _start, and injects a stub if only main exists.
+
+Multi-linker support: Works with MSVC link.exe, LLVM lld-link, or MinGW gcc.
+
+Portable: Distributed as a single .exe — no Python required.
+
+GUI option: Drag-and-drop interface for quick runs.
+
+Installer integration: Adds “Run with Candy Wrapper” right-click menu and double-click execution for .asm, .obj, and .den.
+
+🛠 Requirements
+
+Windows 10 / 11 (x64).
+
+NASM
+ in PATH.
+
+One of the following toolchains installed:
+
+MSVC (Visual Studio Build Tools with Windows SDK)
+
+LLVM (with lld-link)
+
+MinGW-w64 (gcc)
+
+🚀 Installation
+
+Download and run CandyWrapper-x64-setup.exe.
+
+Choose “Add Candy Wrapper to PATH” during install.
+
+Right-click → “Run with Candy Wrapper”, or simply double-click any supported file.
+
+🔧 Usage
+
+From any terminal:
+
+CandyWrapper hello.asm
+CandyWrapper utils.obj
+CandyWrapper demo.den
+
+
+To verify installation:
+
+CandyWrapper --version
+
+
+Expected output:
+
+Candy Wrapper v1.0.0
+Backend: NASM / MSVC | LLVM | MinGW
+
+🔮 Roadmap
+
+Extensible plugins for more custom language frontends.
+
+Cross-platform ELF (Linux) and Mach-O (macOS) output.
+
+Integrated debugger + build logs viewer.
+
+
+
+
+## -----
+
+
+
+
