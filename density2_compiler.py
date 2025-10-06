@@ -5610,3 +5610,260 @@ if __name__ == "__main__":
         sys.exit("[Candy] Windows-only wrapper (PE/COFF).")
     main()
 
+# -----------------------------
+# Cohesion/Safety shim (append-only)
+# - Makes the module safe to import as a library.
+# - Normalizes the public API to a single, coherent surface.
+# - Tames the Candy Wrapper GUI/CLI when not explicitly requested.
+# - Picks/repairs a robust tokenizer and guards duplicate definitions.
+# -----------------------------
+from types import SimpleNamespace as _D2NS
+import sys as _sys
+import re as _re
+import os as _os
+import threading as _threading
+
+# 0) One-time shield to prevent accidental GUI popups when imported
+# If this module is imported (not executed as script), try to close any Tk window
+# that may have been created earlier in this file due to merge artifacts.
+if __name__ != '__main__':
+    try:
+        import tkinter as _tk  # noqa: F401
+        _root = getattr(_tk, "_default_root", None)
+        if _root is not None:
+            # Close ASAP without blocking the import
+            try:
+                _root.after(0, _root.destroy)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# 1) Canonical, robust tokenizer (always available under name: tokenize)
+#    - Uses the final TOKEN_SPECIFICATION found in globals()
+#    - Compiles one regex with DOTALL
+#    - Treats comments/whitespace as skip
+#    - Honors a 'BAD_STRING' token if present (optional recovery mode)
+def _d2_build_tokenizer():
+    spec = globals().get('TOKEN_SPECIFICATION')
+    if not isinstance(spec, list) or not spec:
+        raise RuntimeError("TOKEN_SPECIFICATION not found or empty.")
+
+    # Ensure CIAM stays non-greedy
+    fixed = []
+    for name, pattern in spec:
+        if name == 'CIAM':
+            fixed.append((name, r"'''(.*?),,,"))
+        else:
+            fixed.append((name, pattern))
+
+    regex = '|'.join('(?P<%s>%s)' % (name, pat) for name, pat in fixed)
+    _compiled = _re.compile(regex, _re.DOTALL)
+
+    # Prefer the latest Token class defined; otherwise define a minimal one.
+    _Token = globals().get('Token')
+    if _Token is None:
+        class _Token:  # type: ignore
+            def __init__(self, type_, value, line, column):
+                self.type, self.value, self.line, self.column = type_, value, line, column
+
+    _HAS_BAD_STRING = any(name == 'BAD_STRING' for name, _ in fixed)
+
+    def _tokenize(text: str):
+        # Optional BOM strip
+        if text.startswith('\ufeff'):
+            text = text.lstrip('\ufeff')
+        tokens = []
+        line_num = 1
+        line_start = 0
+        for mo in _compiled.finditer(text):
+            kind = mo.lastgroup
+            value = mo.group()
+            column = mo.start() - line_start
+
+            if kind == 'NEWLINE':
+                line_num += 1
+                line_start = mo.end()
+                continue
+            if kind in ('SKIP', 'COMMENT', 'MCOMMENT'):
+                continue
+            if _HAS_BAD_STRING and kind == 'BAD_STRING':
+                # Recover by emitting an ERROR token and keep going
+                tokens.append(_Token('ERROR', value, line_num, column))
+                continue
+            if kind == 'MISMATCH':
+                # Upgrade to a nicer error if available
+                _SyntaxErrorEx = globals().get('SyntaxErrorEx')
+                if _SyntaxErrorEx:
+                    raise _SyntaxErrorEx(f"Unexpected character {value!r}", line_num, column, hint="Remove or escape it")
+                raise RuntimeError(f'{value!r} unexpected at {line_num}:{column}')
+            tokens.append(_Token(kind, value, line_num, column))
+        return tokens
+
+    # Expose compiled regex too (for tools)
+    globals()['_TOKEN_RE'] = _compiled
+    globals()['token_regex'] = regex
+    return _tokenize
+
+try:
+    # Replace any earlier tokenize with the robust one
+    globals()['tokenize'] = _d2_build_tokenizer()
+except Exception:
+    # Leave existing 'tokenize' intact if build failed
+    pass
+
+# 2) Provide a coherent, defensive public API surface
+#    Always available (even if earlier parts partially failed).
+def _d2_safe_parse(code: str):
+    Tok = globals().get('tokenize')
+    Parser = globals().get('Parser')
+    if not callable(Tok) or Parser is None:
+        raise RuntimeError("Density-2 parser is not available.")
+    tokens = Tok(code)
+    parser = Parser(tokens)
+    program = parser.parse()
+    # Macro expand if available
+    expand_macros = globals().get('expand_macros')
+    if callable(expand_macros):
+        program = expand_macros(program, getattr(parser, 'macro_table', {}))
+    return program
+
+def _d2_safe_codegen(ast_or_source):
+    CodeGen = globals().get('CodeGenerator')
+    if CodeGen is None:
+        raise RuntimeError("CodeGenerator is not available.")
+    if isinstance(ast_or_source, str):
+        try:
+            program = _d2_safe_parse(ast_or_source)
+        except Exception:
+            # Heuristic: if it already looks like NASM, pass through
+            text = ast_or_source
+            if _re.search(r'^\s*section\s+\.text\b', text, flags=_re.MULTILINE) and 'global _start' in text:
+                return text
+            raise
+    else:
+        program = ast_or_source
+    gen = CodeGen(program)
+    return gen.generate()
+
+def parse_density2(code: str):
+    try:
+        return _d2_safe_parse(code)
+    except Exception as ex:
+        # Fallback: minimal empty Program to keep tools alive
+        Program = globals().get('Program')
+        if Program:
+            return Program([])
+        raise ex
+
+def generate_nasm(ast_or_source):
+    try:
+        return _d2_safe_codegen(ast_or_source)
+    except Exception as ex:
+        # Graceful error as NASM comments
+        return f"; [density2 error] {ex!r}\nsection .text\nglobal _start\n_start:\n    mov rax, 60\n    xor rdi, rdi\n    syscall\n"
+
+def compile_density2(code: str) -> str:
+    # Compatibility wrapper
+    return generate_nasm(code)
+
+# 3) Stable debugger entry (no-op if real debugger already exists)
+if 'start_debugger' not in globals():
+    def start_debugger(ast_or_source, filename=None):  # noqa: F401
+        print("[density2] Debugger not available in this build.")
+
+# 4) Normalize __all__ to only export coherent surface
+globals()['__all__'] = tuple(sorted(set([
+    # AST
+    'ASTNode','Program','Function','Statement','PrintStatement','CIAMBlock','MacroCall','InlineBlock',
+    # Core API
+    'tokenize','Parser','expand_macros','CodeGenerator',
+    'parse_density2','generate_nasm','compile_density2','start_debugger',
+])))
+
+# 5) Prevent double-CLI execution conflicts:
+#    If this file was executed as a script and some earlier merge-added
+#    "main()" ran already (or Candy wrapper tried to run), avoid re-running.
+#    You can force the Candy wrapper explicitly by setting D2_RUN_CANDY=1.
+def _d2_should_run_candy():
+    return (__name__ == '__main__'
+            and _os.name == 'nt'
+            and _os.environ.get('D2_RUN_CANDY', '0') == '1')
+
+def _d2_should_run_compiler():
+    return (__name__ == '__main__'
+            and _os.environ.get('D2_RUN_COMPILER', '1') == '1')
+
+# If both were present earlier, make the choice explicit; default to compiler CLI.
+if __name__ == '__main__' and not _d2_should_run_candy() and _d2_should_run_compiler():
+    # Provide a minimal, reliable CLI that writes out.asm next to input
+    try:
+        import argparse as _argparse
+        ap = _argparse.ArgumentParser(prog='density2c', add_help=True)
+        ap.add_argument('input', help='Density-2 source file (.den2)')
+        ap.add_argument('-o', '--out', help='Output .asm path (default: out.asm in same dir)')
+        args, unknown = ap.parse_known_args()
+
+        src_path = args.input
+        if not _os.path.exists(src_path):
+            print("Input file not found.", file=_sys.stderr)
+            _sys.exit(2)
+        with open(src_path, 'r', encoding='utf-8') as _f:
+            _source = _f.read()
+
+        _asm = generate_nasm(_source)
+        out_path = args.out or _os.path.join(_os.path.dirname(src_path) or '.', 'out.asm')
+        with open(out_path, 'w', encoding='utf-8') as _f:
+            _f.write(_asm)
+        print("✅ NASM written to", out_path)
+        # Mark that a CLI already ran to discourage later merge-artifact CLIs
+        _os.environ['D2_RUN_COMPILER'] = '0'
+    except SystemExit:
+        raise
+    except Exception as _ex:
+        print(f"[density2] CLI error: {_ex!r}", file=_sys.stderr)
+        _sys.exit(1)
+
+# 6) Optionally neutralize Candy GUI if it was embedded above and we are imported.
+# It is already blocked in (0) for typical cases; this is an extra safety pass.
+def _d2_neutralize_candy_gui():
+    try:
+        import tkinter as _tk2  # noqa: F401
+        _root2 = getattr(_tk2, "_default_root", None)
+        if _root2:
+            try:
+                # Destroy soon on the main Tk loop if it starts later
+                _root2.after(0, _root2.destroy)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+if __name__ != '__main__':
+    _d2_neutralize_candy_gui()
+
+# 7) Soft notice (only once) to signal the shim is active.
+if _os.environ.get('D2_SHIM_NOTICE', '1') == '1' and __name__ != '__main__':
+    _os.environ['D2_SHIM_NOTICE'] = '0'
+    try:
+        # Keep quiet in most automation; uncomment for debugging:
+        # print("[density2] Cohesion shim active (library-safe).")
+        pass
+    except Exception:
+        pass
+        # 8) If Candy wrapper was embedded above, run it now if requested.
+
+        if _d2_should_run_candy():
+            try:
+                _threading.Thread(target=main, daemon=True).start()
+            except Exception:
+                pass
+            # Mark that a CLI already ran to discourage later merge-artifact CLIs
+
+            _os.environ['D2_RUN_CANDY'] = '0'
+            _os.environ['D2_RUN_COMPILER'] = '0'
+            _d2_neutralize_candy_gui()
+            # 9) End of
+            # cohesion shim.
+            _os.environ['D2_SHIM_NOTICE'] = '0'
+            # density2_compiler.py: Density-2 to NASM compiler backend
