@@ -6501,3 +6501,483 @@ if __name__ == '__main__' and os.environ.get('D2_RUN_TESTS', '0') == '1':
     os.environ['D2_RUN_COMPILER'] = '0'
     os.environ['D2_RUN_CANDY'] = '0'
     # density2_compiler.py: Density-2 to NASM compiler backend
+
+# -----------------------------
+# Density 2 – Append-only extensions:
+# - Formal Type System (augmentations)
+# - Concurrency Primitives (spawn/await/channels)
+# - Package Management (CIAM modules + dependency graph)
+# - Live Editing (hot-reload hooks on mutation tracking)
+# -----------------------------
+from dataclasses import dataclass
+from typing import Optional as _Optional, Callable as _Callable, Iterable as _Iterable
+import json as _json
+import threading as _thr
+
+# ===== 1) Type System augmentations =====
+
+# Reuse the existing simple _Type; add helpers for parametric encodings.
+def D2_ChanOf(inner: _Type) -> _Type:
+    return _Type(f'chan<{getattr(inner, "name", str(inner))}>')
+
+def D2_TaskOf(inner: _Type) -> _Type:
+    return _Type(f'task<{getattr(inner, "name", str(inner))}>')
+
+def D2_TypeFromString(name: str) -> _Type:
+    # Supports "chan<int>", "task<string>", etc.
+    if not isinstance(name, str):
+        return UnknownType
+    n = name.strip().lower()
+    if n in _TYPE_BY_NAME:
+        return _TYPE_BY_NAME[n]
+    return _Type(name)
+
+# Monkey-patch SemanticAnalyzer for new nodes and parametric types
+if 'SemanticAnalyzer' in globals():
+    _D2_SA__infer_expr_type = SemanticAnalyzer._infer_expr_type
+    _D2_SA__analyze_stmt = SemanticAnalyzer._analyze_stmt
+
+    def _d2_infer_expr_type_ext(self: 'SemanticAnalyzer', fn, expr, env):
+        if expr is None:
+            return _D2_SA__infer_expr_type(self, fn, expr, env)
+        cn = expr.__class__.__name__
+
+        # Await returns inner of task<T> if detectable
+        if cn == 'D2AwaitExpr':
+            t = self._infer_expr_type(fn, getattr(expr, 'expr', None), env)  # type: ignore[attr-defined]
+            name = getattr(t, 'name', '')
+            if name.startswith('task<') and name.endswith('>'):
+                inner = name[5:-1]
+                return D2_TypeFromString(inner)
+            return UnknownType
+
+        # Recv returns inner of chan<T> if detectable
+        if cn == 'D2RecvExpr':
+            ct = self._infer_expr_type(fn, getattr(expr, 'chan', None), env)  # type: ignore[attr-defined]
+            cname = getattr(ct, 'name', '')
+            if cname.startswith('chan<') and cname.endswith('>'):
+                inner = cname[5:-1]
+                return D2_TypeFromString(inner)
+            return UnknownType
+
+        # Spawn returns a task<T>; if target expr has a known return type, wrap, else task<unknown>
+        if cn == 'D2SpawnExpr':
+            inner = UnknownType
+            target = getattr(expr, 'expr', None)  # type: ignore[attr-defined]
+            # Try a heuristic: if it's a VarRef of a variable with known type 'task<T>' we just use it; else Unknown
+            it = self._infer_expr_type(fn, target, env)
+            # If the expression is just a constant or such, we do not know T; keep Unknown
+            return D2_TaskOf(inner)
+
+        # Fall back to original
+        return _D2_SA__infer_expr_type(self, fn, expr, env)
+
+    def _d2_analyze_stmt_ext(self: 'SemanticAnalyzer', fn, st, env):
+        cn = st.__class__.__name__
+
+        # Channel declarations introduce a chan<T> variable
+        if cn == 'D2ChanDecl':
+            name = getattr(st, 'name', None)
+            tn = getattr(st, 'type_name', None)  # TypeName or None
+            base_t = _type_from_typename(tn) if tn is not None else UnknownType
+            env[str(name)] = D2_ChanOf(base_t if base_t != UnknownType else UnknownType)
+            setattr(st, '_type', VoidType)
+            return
+
+        # Send: ensure channel and value types are at least compatible if known
+        if cn == 'D2SendStmt':
+            chan_expr = getattr(st, 'chan', None)
+            val_expr = getattr(st, 'value', None)
+            ct = self._infer_expr_type(fn, chan_expr, env)
+            vt = self._infer_expr_type(fn, val_expr, env)
+            cname = getattr(ct, 'name', '')
+            if cname.startswith('chan<') and cname.endswith('>'):
+                inner = D2_TypeFromString(cname[5:-1])
+                if vt != UnknownType and inner != UnknownType and vt != inner:
+                    self._warn(f"Send: value type {vt} differs from channel type {inner}", st)
+            setattr(st, '_type', VoidType)
+            return
+
+        # Unknown concurrency statements default
+        if cn in ('D2SpawnStmt',):
+            setattr(st, '_type', VoidType)
+            return
+
+        return _D2_SA__analyze_stmt(self, fn, st, env)
+
+    # Install patches
+    SemanticAnalyzer._infer_expr_type = _d2_infer_expr_type_ext  # type: ignore[assignment]
+    SemanticAnalyzer._analyze_stmt = _d2_analyze_stmt_ext        # type: ignore[assignment]
+
+
+# ===== 2) Concurrency primitives (AST + parser extensions + IR scaffolding) =====
+
+class D2ChanDecl(Statement):
+    def __init__(self, name: str, type_name: _Optional['TypeName']):
+        self.name = name
+        self.type_name = type_name
+    def __repr__(self): return f"D2ChanDecl({self.name!r}, type={self.type_name!r})"
+
+class D2SendStmt(Statement):
+    def __init__(self, chan: ASTNode, value: ASTNode):
+        self.chan = chan
+        self.value = value
+    def __repr__(self): return f"D2Send({self.chan!r}, {self.value!r})"
+
+class D2SpawnExpr(ASTNode):
+    def __init__(self, expr: ASTNode):
+        self.expr = expr
+    def __repr__(self): return f"D2Spawn({self.expr!r})"
+
+class D2AwaitExpr(ASTNode):
+    def __init__(self, expr: ASTNode):
+        self.expr = expr
+    def __repr__(self): return f"D2Await({self.expr!r})"
+
+class D2RecvExpr(ASTNode):
+    def __init__(self, chan: ASTNode):
+        self.chan = chan
+    def __repr__(self): return f"D2Recv({self.chan!r})"
+
+# Parser extension (monkey-patch) for: Chan/Send statements; Spawn/Await/Recv expressions
+if 'Parser' in globals():
+    _D2_parse_statement_orig = Parser.parse_statement
+    _D2_parse_primary_orig = getattr(Parser, '_parse_primary', None)
+
+    def _d2_parse_statement(self: 'Parser'):
+        tok = self.peek()
+        if tok and tok.type == 'IDENT':
+            val = tok.value
+
+            # Chan name [: Type] ;
+            if val == 'Chan':
+                self.consume('IDENT')  # Chan
+                name_tok = self.consume('IDENT')
+                tname = None
+                if self.match('COLON'):
+                    t_ident = self.consume('IDENT')
+                    tname = TypeName(t_ident.value)
+                self.consume('SEMICOLON')
+                return D2ChanDecl(name_tok.value, tname)
+
+            # Send(channel, expr);
+            if val == 'Send':
+                self.consume('IDENT')  # Send
+                self.consume('LPAREN')
+                chan_expr = self.parse_expression()
+                self.consume('COMMA')
+                value_expr = self.parse_expression()
+                self.consume('RPAREN')
+                self.consume('SEMICOLON')
+                return D2SendStmt(chan_expr, value_expr)
+
+            # Allow Spawn(...) as statement (discard handle)
+            if val == 'Spawn':
+                expr = _d2_parse_spawn_expr(self)
+                self.consume('SEMICOLON')
+                return ExprStatement(expr)
+
+        # Fallback to original
+        return _D2_parse_statement_orig(self)
+
+    def _d2_parse_spawn_expr(self: 'Parser') -> D2SpawnExpr:
+        # Spawn '(' expression ')'
+        self.consume('IDENT')  # Spawn
+        self.consume('LPAREN')
+        inner = self.parse_expression()
+        self.consume('RPAREN')
+        return D2SpawnExpr(inner)
+
+    def _d2_parse_await_expr(self: 'Parser') -> D2AwaitExpr:
+        # Await '(' expression ')'
+        self.consume('IDENT')  # Await
+        self.consume('LPAREN')
+        inner = self.parse_expression()
+        self.consume('RPAREN')
+        return D2AwaitExpr(inner)
+
+    def _d2_parse_recv_expr(self: 'Parser') -> D2RecvExpr:
+        # Recv '(' expression ')'
+        self.consume('IDENT')  # Recv
+        self.consume('LPAREN')
+        ch = self.parse_expression()
+        self.consume('RPAREN')
+        return D2RecvExpr(ch)
+
+    def _d2_parse_primary(self: 'Parser'):
+        tok = self.peek()
+        if tok and tok.type == 'IDENT':
+            kw = tok.value
+            if kw == 'Spawn':
+                return _d2_parse_spawn_expr(self)
+            if kw == 'Await':
+                return _d2_parse_await_expr(self)
+            if kw == 'Recv':
+                return _d2_parse_recv_expr(self)
+        # Fall back to original primary
+        if callable(_D2_parse_primary_orig):
+            return _D2_parse_primary_orig(self)
+        # If no primary exists (older parser), emulate minimal STRING/INT/IDENT path
+        # Defer to existing parse_expression error handling.
+        return _D2_parse_primary_orig(self)  # type: ignore[misc]
+
+    # Install parser patches
+    Parser.parse_statement = _d2_parse_statement  # type: ignore[assignment]
+    if _D2_parse_primary_orig is not None:
+        Parser._parse_primary = _d2_parse_primary  # type: ignore[assignment]
+
+# IR scaffolding: ignore concurrency at codegen/IR and leave as comments
+if 'IRBuilder' in globals():
+    _D2_ir_emit_stmt = IRBuilder._emit_stmt
+
+    def _d2_ir_emit_stmt(self: 'IRBuilder', fn, st):
+        cn = st.__class__.__name__
+        if cn in ('D2ChanDecl',):
+            # Allocate a slot to model the channel handle
+            slot = self._slot(fn, getattr(st, 'name', None))
+            self._emit('alloc', dst=slot, comment='chan')
+            return
+        if cn in ('D2SendStmt',):
+            self._emit('comment', comment='Send(chan, value)')
+            return
+        if cn in ('ExprStatement',) and isinstance(getattr(st, 'expr', None), D2SpawnExpr):
+            self._emit('comment', comment='Spawn(expr)')
+            return
+        # Default
+        return _D2_ir_emit_stmt(self, fn, st)
+
+    IRBuilder._emit_stmt = _d2_ir_emit_stmt  # type: ignore[assignment]
+
+
+# ===== 3) Package Management – CIAM-as-Modules + dependency graph =====
+
+@dataclass
+class D2Module:
+    name: str                 # Macro name (CIAM header)
+    key: str                  # Stable hash of body
+    exports: list[str]        # exported macro names (typically [name])
+    deps: list[str]           # names of required modules
+    body: str                 # raw CIAM body
+
+class D2DepGraph:
+    def __init__(self):
+        self.nodes: dict[str, D2Module] = {}
+        self.adj: dict[str, set[str]] = {}
+
+    def add(self, mod: D2Module):
+        self.nodes[mod.name] = mod
+        self.adj.setdefault(mod.name, set())
+        for d in mod.deps:
+            self.adj.setdefault(mod.name, set()).add(d)
+            self.adj.setdefault(d, set())
+
+    def topo_order(self) -> list[str]:
+        # Kahn's algorithm
+        indeg: dict[str, int] = {n: 0 for n in self.adj}
+        for u in self.adj:
+            for v in self.adj[u]:
+                indeg[v] = indeg.get(v, 0) + 1
+        q = [n for n, d in indeg.items() if d == 0]
+        out: list[str] = []
+        while q:
+            u = q.pop(0)
+            out.append(u)
+            for v in self.adj.get(u, ()):
+                indeg[v] -= 1
+                if indeg[v] == 0:
+                    q.append(v)
+        if len(out) != len(indeg):
+            # cycle present; return partial order followed by remaining
+            remaining = [n for n in indeg if n not in out]
+            return out + remaining
+        return out
+
+    def to_manifest(self) -> str:
+        payload = {
+            'modules': [
+                {
+                    'name': m.name,
+                    'key': m.key,
+                    'exports': m.exports,
+                    'deps': m.deps,
+                } for m in self.nodes.values()
+            ],
+            'order': self.topo_order(),
+        }
+        return _json.dumps(payload, indent=2)
+
+def d2_scan_ciam_modules_from_source(source: str) -> list[D2Module]:
+    """
+    Lightweight CIAM scanner from raw source (no full parse needed).
+    - Detects blocks: '''Name(args) ... ,,,
+    - deps are found via lines like: // require: OtherModule
+    """
+    if not isinstance(source, str):
+        return []
+    mods: list[D2Module] = []
+    # Non-greedy CIAM capture
+    for m in re.finditer(r"'''([A-Za-z_]\w*)\s*\((.*?)\)\s*(.*?),,,", source, re.DOTALL):
+        name = m.group(1)
+        body = m.group(3).strip()
+        deps: list[str] = []
+        for ln in body.splitlines():
+            ln = ln.strip()
+            mo = re.match(r'//\s*require\s*:\s*([A-Za-z_]\w*)', ln, re.IGNORECASE)
+            if mo:
+                deps.append(mo.group(1))
+        key = hashlib.sha1(body.encode('utf-8')).hexdigest()[:16]
+        mods.append(D2Module(name=name, key=key, exports=[name], deps=deps, body=body))
+    return mods
+
+def d2_build_depgraph(mods: _Iterable[D2Module]) -> D2DepGraph:
+    g = D2DepGraph()
+    for m in mods:
+        g.add(m)
+    return g
+
+
+# ===== 4) Live Editing – hot-reload hooks on mutation tracking =====
+
+# Subscribe to mutation events by wrapping ASTNode._record_mutation if present
+_D2_MUTATION_SUBS: list[_Callable[[dict], None]] = []
+
+def d2_subscribe_mutations(cb: _Callable[[dict], None]) -> None:
+    if cb not in _D2_MUTATION_SUBS:
+        _D2_MUTATION_SUBS.append(cb)
+
+def d2_unsubscribe_mutations(cb: _Callable[[dict], None]) -> None:
+    try:
+        _D2_MUTATION_SUBS.remove(cb)
+    except ValueError:
+        pass
+
+# Wrap the existing _record_mutation to fan-out events
+if hasattr(ASTNode, '_record_mutation'):
+    _D2_orig_record_mutation = ASTNode._record_mutation  # type: ignore[attr-defined]
+
+    def _d2_record_mutation_and_publish(self: ASTNode, *, op: str, field: str, before, after, detail: _Optional[dict]):
+        _D2_orig_record_mutation(self, op=op, field=field, before=before, after=after, detail=detail)  # type: ignore[misc]
+        ev = {
+            'node': self.__class__.__name__,
+            'op': op,
+            'field': field,
+            'before': before,
+            'after': after,
+            'detail': detail or {},
+            'ts': time.time(),
+        }
+        for cb in list(_D2_MUTATION_SUBS):
+            try:
+                cb(ev)
+            except Exception:
+                # Keep engine resilient
+                pass
+
+    ASTNode._record_mutation = _d2_record_mutation_and_publish  # type: ignore[assignment]
+
+class D2HotReloadEngine:
+    """
+    Hot-reload scaffolding:
+    - watch(program, on_change): enable tracking and invoke on_change(events_batch) asynchronously.
+    - stop(): detach.
+    - optional debounce_ms to coalesce bursts.
+    """
+    def __init__(self, debounce_ms: int = 100):
+        self._debounce = max(0, debounce_ms) / 1000.0
+        self._buf: list[dict] = []
+        self._lock = _thr.Lock()
+        self._timer: _Optional[_thr.Timer] = None
+        self._on_change: _Optional[_Callable[[list[dict]], None]] = None
+
+    def _flush(self):
+        with self._lock:
+            batch = self._buf[:]
+            self._buf.clear()
+        if batch and self._on_change:
+            try:
+                self._on_change(batch)
+            except Exception:
+                pass
+
+    def _schedule(self):
+        if self._debounce <= 0:
+            self._flush()
+            return
+        if self._timer and self._timer.is_alive():
+            return
+        self._timer = _thr.Timer(self._debounce, self._flush)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _on_mut(self, ev: dict):
+        with self._lock:
+            self._buf.append(ev)
+        self._schedule()
+
+    def watch(self, program: Program, on_change: _Callable[[list[dict]], None]):
+        self._on_change = on_change
+        # Ensure tracking is on
+        if hasattr(program, 'enable_mutation_tracking'):
+            program.enable_mutation_tracking(True, recursive=True)  # type: ignore[misc]
+        d2_subscribe_mutations(self._on_mut)
+
+    def stop(self):
+        d2_unsubscribe_mutations(self._on_mut)
+        with self._lock:
+            self._buf.clear()
+        if self._timer and self._timer.is_alive():
+            try:
+                self._timer.cancel()
+            except Exception:
+                pass
+        self._timer = None
+        self._on_change = None
+
+# Simple collaborative scaffold: collect and merge event streams.
+class D2CollabSession:
+    def __init__(self):
+        self._events: list[dict] = []
+
+    def ingest_local(self, events: list[dict]):
+        self._events.extend(events)
+
+    def ingest_remote(self, events: list[dict]):
+        # Merge by timestamp; no conflict resolution at AST level (scaffold)
+        self._events.extend(events)
+        self._events.sort(key=lambda e: e.get('ts', 0.0))
+
+    def history(self) -> list[dict]:
+        return list(self._events)
+
+# Convenience utilities
+def d2_on_hot_reload_reemit_program(program: Program, *, reemit_ir: bool = False) -> D2HotReloadEngine:
+    """
+    Example: on changes, print IR or NASM to stdout (scaffold for IDE integration).
+    """
+    def on_change(batch: list[dict]):
+        try:
+            if reemit_ir and 'ast_to_ir' in globals():
+                ir = ast_to_ir(program)  # type: ignore[misc]
+                print(ir_to_text(ir))
+            else:
+                asm = generate_nasm(program)  # type: ignore[misc]
+                print(asm)
+        except Exception as ex:
+            print(f"; [hot-reload error] {ex!r}")
+
+    eng = D2HotReloadEngine(debounce_ms=150)
+    eng.watch(program, on_change)
+    return eng
+
+# Public API exposure (append-only)
+try:
+    __all__ = tuple(sorted(set(__all__ + (
+        'D2_ChanOf','D2_TaskOf','D2_TypeFromString',
+        'D2ChanDecl','D2SendStmt','D2SpawnExpr','D2AwaitExpr','D2RecvExpr',
+        'D2Module','D2DepGraph','d2_scan_ciam_modules_from_source','d2_build_depgraph',
+        'd2_subscribe_mutations','d2_unsubscribe_mutations',
+        'D2HotReloadEngine','D2CollabSession','d2_on_hot_reload_reemit_program',
+    ))))
+except Exception:
+    pass
+
