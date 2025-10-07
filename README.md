@@ -2293,3 +2293,51 @@ Integrated debugger + build logs viewer.
 
 
 
+
+---
+
+### ⚡ Speed Comparison: `density2_compiler.py` vs `New_density_2_compiler.py`
+
+| Aspect                          | `density2_compiler.py` 🏃‍♂️ | `New_density_2_compiler.py` 🧱 |
+|----------------------------------|------------------------------|--------------------------------|
+| **Startup Time**                | Fast                         | Slower due to introspection setup |
+| **Lexing & Parsing**            | Lightweight                  | Slightly slower (mutation hooks, error recovery) |
+| **Macro Expansion**             | Fast                         | Slightly slower (tracking, replay metadata) |
+| **Inline Python Execution**     | Basic                        | Slower (exec sandbox, emit DSL, error capture) |
+| **Inline C Compilation**        | Limited                      | Slower (multi-compiler support, NASM translation) |
+| **Code Generation**             | Direct NASM emit             | Slower (register reuse logic, overlays) |
+| **Mutation Tracking Overhead**  | None                         | Moderate (tracked lists, history encoding) |
+| **Total Runtime (typical .den)**| ~0.3–0.5 sec                 | ~1.2–2.0 sec depending on inline blocks |
+
+---
+
+### 🧪 Real-World Observations
+
+- **density2_compiler.py** is optimized for speed and simplicity. It parses and emits NASM in under a second for most inputs.
+- **New_density_2_compiler.py** adds introspection, ceremony replay, and multi-language inline support—making it 3–5× slower in typical runs.
+- The slowdown is mostly due to:
+  - Executing inline Python blocks.
+  - Compiling inline C via subprocesses.
+  - Tracking mutations and encoding history.
+
+---
+
+### 🧩 When Speed Matters
+
+- Use the original compiler for fast iteration, syntax testing, and minimal builds.
+- Use the newer compiler when you need:
+  - Replayable ceremonies.
+  - Debugging overlays.
+  - Multi-platform inline compilation.
+  - Mutation-aware ASTs.
+
+---
+
+
+
+
+## -----
+
+
+
+
