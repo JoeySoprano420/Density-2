@@ -11762,3 +11762,641 @@ class CodeGenerator:
 # See also: examples/README.md for tutorial and sample projects.
 # -----------------------------
 
+class ErrorStatement(Statement):
+    def __init__(self, code: int, message: str):
+        self.code = code
+        self.message = message
+
+    def __repr__(self):
+        return f"Error(code={self.code}, message={self.message!r})"
+
+class AllocationTracker:
+    def __init__(self):
+        self.allocations = []
+
+    def register(self, name: str, size: int):
+        self.allocations.append((name, size))
+
+    def emit_cleanup(self) -> List[str]:
+        lines = []
+        for name, _ in self.allocations:
+            lines.append(f' free({name});')
+        return lines
+
+def compile_and_run_nasm(nasm_code: str, platform: str = 'linux') -> str:
+    tmpdir = tempfile.mkdtemp(prefix='den2_run_')
+    asm_path = os.path.join(tmpdir, 'out.asm')
+    obj_path = os.path.join(tmpdir, 'out.o')
+    exe_path = os.path.join(tmpdir, 'out')
+
+    with open(asm_path, 'w') as f:
+        f.write(nasm_code)
+
+    if platform == 'linux':
+        subprocess.run(['nasm', '-f', 'elf64', asm_path, '-o', obj_path], check=True)
+        subprocess.run(['ld', obj_path, '-o', exe_path], check=True)
+    elif platform == 'windows':
+        subprocess.run(['nasm', '-f', 'win64', asm_path, '-o', obj_path], check=True)
+        subprocess.run(['link', '/SUBSYSTEM:CONSOLE', obj_path, '/OUT:' + exe_path], check=True)
+    elif platform == 'macos':
+        subprocess.run(['nasm', '-f', 'macho64', asm_path, '-o', obj_path], check=True)
+        subprocess.run(['ld', '-macosx_version_min', '10.13', '-e', '_start', '-lSystem', '-o', exe_path, obj_path], check=True)
+
+    result = subprocess.run([exe_path], capture_output=True, text=True)
+    shutil.rmtree(tmpdir)
+    return result.stdout
+
+import os, tempfile, subprocess, shutil, threading, hashlib
+from typing import List, Tuple
+
+class UltraCompiler:
+    def __init__(self, platform: str = 'linux'):
+        self.platform = platform
+        self.cache_dir = os.path.join(tempfile.gettempdir(), 'den2_cache')
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def hash_code(self, code: str) -> str:
+        return hashlib.sha256(code.encode()).hexdigest()
+
+    def compile_nasm(self, asm_code: str) -> str:
+        hash_id = self.hash_code(asm_code)
+        asm_path = os.path.join(self.cache_dir, f'{hash_id}.asm')
+        obj_path = os.path.join(self.cache_dir, f'{hash_id}.o')
+        exe_path = os.path.join(self.cache_dir, f'{hash_id}.bin')
+
+        if os.path.exists(exe_path):
+            return exe_path  # Cached binary
+
+        with open(asm_path, 'w') as f:
+            f.write(asm_code)
+
+        if self.platform == 'linux':
+            subprocess.run(['nasm', '-f', 'elf64', asm_path, '-o', obj_path], check=True)
+            subprocess.run(['ld', obj_path, '-o', exe_path], check=True)
+        elif self.platform == 'windows':
+            subprocess.run(['nasm', '-f', 'win64', asm_path, '-o', obj_path], check=True)
+            subprocess.run(['link', '/SUBSYSTEM:CONSOLE', obj_path, '/OUT:' + exe_path], check=True)
+        elif self.platform == 'macos':
+            subprocess.run(['nasm', '-f', 'macho64', asm_path, '-o', obj_path], check=True)
+            subprocess.run(['ld', '-macosx_version_min', '10.13', '-e', '_start', '-lSystem', '-o', exe_path, obj_path], check=True)
+
+        return exe_path
+
+    def run_binary(self, exe_path: str) -> str:
+        result = subprocess.run([exe_path], capture_output=True, text=True)
+        return result.stdout.strip()
+
+    def compile_and_run(self, asm_code: str) -> str:
+        exe_path = self.compile_nasm(asm_code)
+        return self.run_binary(exe_path)
+
+class ParallelCompiler:
+    def __init__(self, compiler: UltraCompiler):
+        self.compiler = compiler
+
+    def compile_batch(self, asm_list: List[str]) -> List[str]:
+        results = [None] * len(asm_list)
+        threads = []
+
+        def compile_task(i, code):
+            try:
+                results[i] = self.compiler.compile_and_run(code)
+            except Exception as e:
+                results[i] = f'[Error] {e}'
+
+        for i, code in enumerate(asm_list):
+            t = threading.Thread(target=compile_task, args=(i, code))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        return results
+
+def compile_inline_c(c_code: str, platform: str = 'linux') -> str:
+    tmpdir = tempfile.mkdtemp(prefix='den2_c_')
+    c_path = os.path.join(tmpdir, 'main.c')
+    exe_path = os.path.join(tmpdir, 'main')
+
+    with open(c_path, 'w') as f:
+        f.write(c_code)
+
+    if platform == 'linux':
+        subprocess.run(['gcc', c_path, '-o', exe_path], check=True)
+    elif platform == 'windows':
+        subprocess.run(['cl', c_path, '/Fe:' + exe_path], check=True)
+    elif platform == 'macos':
+        subprocess.run(['clang', c_path, '-o', exe_path], check=True)
+
+    result = subprocess.run([exe_path], capture_output=True, text=True)
+    shutil.rmtree(tmpdir)
+    return result.stdout.strip()
+
+def execute_inline_python(py_code: str) -> str:
+    try:
+        local_vars = {}
+        exec(py_code, {}, local_vars)
+        return str(local_vars.get('result', '[No result]'))
+    except Exception as e:
+        return f'[Python Error] {e}'
+
+def run_density2_program(density2_source: str, platform: str = 'linux') -> str:
+    ast = Parser(Lexer(density2_source).tokenize()).parse()
+    codegen = CodeGenerator()
+    asm_code = codegen.generate(ast)
+    compiler = UltraCompiler(platform)
+    return compiler.compile_and_run(asm_code)
+
+class ErrorRegistry:
+    def __init__(self):
+        self.errors = {}
+
+    def register(self, name: str, code: int, message: str):
+        self.errors[name] = (code, message)
+
+    def emit_definitions(self) -> List[str]:
+        lines = []
+        for name, (code, msg) in self.errors.items():
+            lines.append(f'#define ERR_{name} {code}')
+            lines.append(f'const char* ERR_MSG_{name} = "{msg}";')
+        return lines
+
+class MemoryArena:
+    def __init__(self):
+        self.allocs = []
+
+    def alloc(self, name: str, size: int):
+        self.allocs.append((name, size))
+
+    def emit_cleanup(self) -> List[str]:
+        return [f'free({name});' for name, _ in self.allocs]
+
+def run_density2_file(path: str, platform: str = 'linux'):
+    with open(path) as f:
+        source = f.read()
+
+    lexer = Lexer(source)
+    tokens = lexer.tokenize()
+    parser = Parser(tokens)
+    ast = parser.parse()
+
+    codegen = CodeGenerator()
+    asm = codegen.generate(ast)
+
+    output = compile_and_run_nasm(asm, platform)
+    print("=== Program Output ===")
+    print(output)
+
+def encode_dodecagram(ast: Node) -> str:
+    alphabet = '0123456789ab'
+    def encode_node(node):
+        tag = type(node).__name__
+        return alphabet[hash(tag) % len(alphabet)]
+    return ''.join(encode_node(n) for n in ast.traverse())
+
+class ErrorStatement(Statement):
+    def __init__(self, code: int, message: str):
+        self.code = code
+        self.message = message
+
+def parse_error(self) -> ErrorStatement:
+    self.consume('IDENT')  # Error
+    self.consume('COLON')
+    self.consume('LPAREN')
+    code_tok = self.consume('IDENT')
+    self.consume('COMMA')
+    msg_tok = self.consume('STRING')
+    self.consume('RPAREN')
+    self.consume('SEMICOLON')
+    return ErrorStatement(int(code_tok.value), eval(msg_tok.value))
+
+def _emit_error(self, stmt: ErrorStatement):
+    label, length = self._get_string_label(stmt.message)
+    self.text_lines += [
+        ' mov rax, 1',
+        ' mov rdi, 2',
+        f' mov rsi, {label}',
+        f' mov rdx, {length}',
+        ' syscall',
+        f' mov rax, 60',
+        f' mov rdi, {stmt.code}',
+        ' syscall'
+    ]
+
+class AllocationTracker:
+    def __init__(self):
+        self.allocations = []
+
+    def register(self, name: str, size: int):
+        self.allocations.append((name, size))
+
+    def emit_cleanup(self) -> List[str]:
+        return [f' free({name});' for name, _ in self.allocations]
+
+def compile_and_run_nasm(nasm_code: str, platform: str = 'linux') -> str:
+    tmpdir = tempfile.mkdtemp(prefix='den2_run_')
+    asm_path = os.path.join(tmpdir, 'out.asm')
+    obj_path = os.path.join(tmpdir, 'out.o')
+    exe_path = os.path.join(tmpdir, 'out')
+
+    with open(asm_path, 'w') as f:
+        f.write(nasm_code)
+
+    if platform == 'linux':
+        subprocess.run(['nasm', '-f', 'elf64', asm_path, '-o', obj_path], check=True)
+        subprocess.run(['ld', obj_path, '-o', exe_path], check=True)
+    elif platform == 'windows':
+        subprocess.run(['nasm', '-f', 'win64', asm_path, '-o', obj_path], check=True)
+        subprocess.run(['link', '/SUBSYSTEM:CONSOLE', obj_path, '/OUT:' + exe_path], check=True)
+    elif platform == 'macos':
+        subprocess.run(['nasm', '-f', 'macho64', asm_path, '-o', obj_path], check=True)
+        subprocess.run(['ld', '-macosx_version_min', '10.13', '-e', '_start', '-lSystem', '-o', exe_path, obj_path], check=True)
+
+    result = subprocess.run([exe_path], capture_output=True, text=True)
+    shutil.rmtree(tmpdir)
+    return result.stdout
+
+def compile_inline_c(c_code: str, platform: str = 'linux') -> str:
+    tmpdir = tempfile.mkdtemp(prefix='den2_c_')
+    c_path = os.path.join(tmpdir, 'main.c')
+    exe_path = os.path.join(tmpdir, 'main')
+
+    with open(c_path, 'w') as f:
+        f.write(c_code)
+
+    if platform == 'linux':
+        subprocess.run(['gcc', c_path, '-o', exe_path], check=True)
+    elif platform == 'windows':
+        subprocess.run(['cl', c_path, '/Fe:' + exe_path], check=True)
+    elif platform == 'macos':
+        subprocess.run(['clang', c_path, '-o', exe_path], check=True)
+
+    result = subprocess.run([exe_path], capture_output=True, text=True)
+    shutil.rmtree(tmpdir)
+    return result.stdout.strip()
+
+def execute_inline_python(py_code: str) -> str:
+    try:
+        local_vars = {}
+        exec(py_code, {}, local_vars)
+        return str(local_vars.get('result', '[No result]'))
+    except Exception as e:
+        return f'[Python Error] {e}'
+
+class ParallelCompiler:
+    def __init__(self, compiler):
+        self.compiler = compiler
+
+    def compile_batch(self, asm_list: List[str]) -> List[str]:
+        results = [None] * len(asm_list)
+        threads = []
+
+        def compile_task(i, code):
+            try:
+                results[i] = self.compiler.compile_and_run(code)
+            except Exception as e:
+                results[i] = f'[Error] {e}'
+
+        for i, code in enumerate(asm_list):
+            t = threading.Thread(target=compile_task, args=(i, code))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
+
+        return results
+
+def encode_dodecagram(ast: Node) -> str:
+    alphabet = '0123456789ab'
+    def encode_node(node):
+        tag = type(node).__name__
+        return alphabet[hash(tag) % len(alphabet)]
+    return ''.join(encode_node(n) for n in ast.traverse())
+
+def get_io_macros():
+    return {
+        'PrintLine': '''PrintLine(msg)
+#c
+printf("%s\\n", msg);
+#endc
+,,,''',
+        'ReadLine': '''ReadLine(buffer, size)
+#c
+fgets(buffer, size, stdin);
+#endc
+,,,'''
+    }
+
+def load_stdlib_macros():
+    import importlib
+    macros = {}
+    modules = ['io', 'math', 'net', 'crypto', 'threading', 'fs', 'system']
+    for mod in modules:
+        m = importlib.import_module(f'density_stdlib.{mod}')
+        macros.update(m.get_io_macros() if hasattr(m, 'get_io_macros') else {})
+    return macros
+
+ciam_macros.update(load_stdlib_macros())
+
+class EmitPlugin:
+    def generate(self, ast: Node) -> str:
+        raise NotImplementedError
+
+class LLVMIREmitter(EmitPlugin):
+    def generate(self, ast: Node) -> str:
+        lines = ['; ModuleID = "density2"', 'declare i32 @printf(i8*, ...)']
+        for stmt in ast.body:
+            if isinstance(stmt, PrintStatement):
+                lines.append(f'call i32 (i8*, ...) @printf("{stmt.value}\\0A")')
+        return '\n'.join(lines)
+
+def load_emit_plugin(target: str) -> EmitPlugin:
+    import importlib
+    plugin = importlib.import_module(f'emit_plugins.{target}')
+    return plugin.Emitter()
+
+plugin = load_emit_plugin('llvm_ir')
+ir_code = plugin.generate(ast)
+with open('out.ll', 'w') as f:
+    f.write(ir_code)
+
+class PluginRegistry:
+    def __init__(self):
+        self.plugins = {}
+
+    def register(self, name: str, plugin: EmitPlugin, description: str):
+        self.plugins[name] = {'plugin': plugin, 'desc': description}
+
+    def list_plugins(self):
+        return [(name, meta['desc']) for name, meta in self.plugins.items()]
+
+import json, os
+from .registry import fetch_package
+from .installer import install_package
+
+def load_config():
+    with open('denpkg/config.json') as f:
+        return json.load(f)
+
+def install(name: str, version: str = 'latest'):
+    pkg = fetch_package(name, version)
+    install_package(pkg)
+
+def import_macros(name: str) -> str:
+    path = f'denpkg/packages/{name}/macros.den'
+    with open(path) as f:
+        return f.read()
+
+def fetch_package(name: str, version: str):
+    # Local registry fallback
+    path = f'denpkg/packages/{name}/macros.den'
+    if os.path.exists(path):
+        return {'name': name, 'version': version, 'path': path}
+    # Remote fetch (stubbed)
+    raise Exception(f'Package {name} not found')
+
+import os, shutil
+
+def install_package(pkg):
+    os.makedirs(f'denpkg/packages/{pkg["name"]}', exist_ok=True)
+    shutil.copy(pkg['path'], f'denpkg/packages/{pkg["name"]}/macros.den')
+
+class TypeDef:
+    def __init__(self, name: str, fields: Dict[str, str], traits: List[str]):
+        self.name = name
+        self.fields = fields
+        self.traits = traits
+
+class TraitDef:
+    def __init__(self, name: str, methods: List[str]):
+        self.name = name
+        self.methods = methods
+
+class GenericType:
+    def __init__(self, base: str, param: str):
+        self.base = base
+        self.param = param
+
+class TypeRegistry:
+    def __init__(self):
+        self.types = {}
+        self.traits = {}
+
+    def register_type(self, typedef: TypeDef):
+        self.types[typedef.name] = typedef
+
+    def register_trait(self, trait: TraitDef):
+        self.traits[trait.name] = trait
+
+    def implements(self, typename: str, traitname: str) -> bool:
+        return traitname in self.types[typename].traits
+
+class GenericInstantiator:
+    def instantiate(self, generic: GenericType) -> TypeDef:
+        base = self.types[generic.base]
+        fields = {k: v.replace('T', generic.param) for k, v in base.fields.items()}
+        return TypeDef(f'{generic.base}<{generic.param}>', fields, base.traits)
+
+def describe_type(name: str, registry: TypeRegistry):
+    t = registry.types[name]
+    return {
+        'fields': t.fields,
+        'traits': t.traits,
+        'is_serializable': registry.implements(name, 'Serializable')
+    }
+
+self.text_lines.append(f'; Type: {typedef.name}')
+for field, typ in typedef.fields.items():
+    self.text_lines.append(f';   {field}: {typ}')
+
+class ASTMutationTracker:
+    def __init__(self):
+        self.history = []
+
+    def record(self, node, action, context=None):
+        self.history.append({
+            'node': repr(node),
+            'action': action,
+            'context': context
+        })
+
+    def encode(self) -> str:
+        return '\n'.join(
+            f"[{i}] {h['action']} → {h['node']} ({h['context']})"
+            for i, h in enumerate(self.history)
+        )
+
+tracker.record(node, 'expanded_macro', macro_name)
+tracker.record(node, 'replaced_node', 'CIAM expansion')
+tracker.record(node, 'optimized', 'register reuse')
+
+class SourceMap:
+    def __init__(self):
+        self.map = {}  # asm_line → source_line
+
+    def register(self, asm_line: int, source_line: int):
+        self.map[asm_line] = source_line
+
+    def emit(self) -> List[str]:
+        return [f'; line {asm} ← source {src}' for asm, src in self.map.items()]
+
+def emit_line(self, line: str, source_line: int):
+    self.text_lines.append(line)
+    self.source_map.register(len(self.text_lines), source_line)
+
+def run_debug_session(source: str):
+    lexer = Lexer(source)
+    tokens = lexer.tokenize()
+    parser = Parser(tokens)
+    ast = parser.parse()
+
+    tracker = ASTMutationTracker()
+    codegen = CodeGenerator()
+    codegen.tracker = tracker
+    codegen.source_map = SourceMap()
+
+    asm = codegen.generate(ast)
+    asm += '\n'.join(codegen.source_map.emit())
+    asm += f'\n; AST MUTATION TRACE\n{tracker.encode()}'
+
+    output = compile_and_run_nasm(asm)
+    print("=== Program Output ===")
+    print(output)
+
+def encode_dodecagram(ast: Node) -> str:
+    alphabet = '0123456789ab'
+    def encode_node(node):
+        tag = type(node).__name__
+        return alphabet[hash(tag) % len(alphabet)]
+    return ''.join(encode_node(n) for n in ast.traverse())
+
+self.text_lines.append(f'; DODECAGRAM: {encode_dodecagram(ast)}')
+
+class ASTMutationTracker:
+    def __init__(self):
+        self.history = []
+
+    def record(self, node, action, context=None):
+        self.history.append({
+            'node': repr(node),
+            'action': action,
+            'context': context
+        })
+
+    def encode_trace(self) -> str:
+        return '\n'.join(
+            f"[{i}] {h['action']} → {h['node']} ({h['context']})"
+            for i, h in enumerate(self.history)
+        )
+
+tracker.record(node, 'expanded_macro', macro_name)
+tracker.record(node, 'optimized', 'register reuse')
+tracker.record(node, 'replaced_node', 'CIAM → Inline C')
+
+self.text_lines.append('; AST MUTATION TRACE')
+self.text_lines += [f'; {line}' for line in tracker.encode_trace().split('\n')]
+
+class SourceMap:
+    def __init__(self):
+        self.map = {}  # asm_line → source_line
+
+    def register(self, asm_line: int, source_line: int):
+        self.map[asm_line] = source_line
+
+    def emit(self) -> List[str]:
+        return [f'; line {asm} ← source {src}' for asm, src in self.map.items()]
+
+def emit_line(self, line: str, source_line: int):
+    self.text_lines.append(line)
+    self.source_map.register(len(self.text_lines), source_line)
+
+def run_debug_session(source: str):
+    lexer = Lexer(source)
+    tokens = lexer.tokenize()
+    parser = Parser(tokens)
+    ast = parser.parse()
+
+    tracker = ASTMutationTracker()
+    codegen = CodeGenerator()
+    codegen.tracker = tracker
+    codegen.source_map = SourceMap()
+
+    asm = codegen.generate(ast)
+    asm += '\n'.join(codegen.source_map.emit())
+    asm += f'\n; AST MUTATION TRACE\n{tracker.encode_trace()}'
+
+    output = compile_and_run_nasm(asm)
+    print("=== Program Output ===")
+    print(output)
+
+def encode_dodecagram(ast: Node) -> str:
+    alphabet = '0123456789ab'
+    def encode_node(node):
+        tag = type(node).__name__
+        return alphabet[hash(tag) % len(alphabet)]
+    return ''.join(encode_node(n) for n in ast.traverse())
+
+self.text_lines.append(f'; DODECAGRAM: {encode_dodecagram(ast)}')
+
+class ASTMutationTracker:
+    def __init__(self):
+        self.history = []
+
+    def record(self, node, action, context=None):
+        self.history.append({
+            'node': repr(node),
+            'action': action,
+            'context': context
+        })
+
+    def encode_trace(self) -> str:
+        return '\n'.join(
+            f"[{i}] {h['action']} → {h['node']} ({h['context']})"
+            for i, h in enumerate(self.history)
+        )
+
+class SourceMap:
+    def __init__(self):
+        self.map = {}  # asm_line → source_line
+
+    def register(self, asm_line: int, source_line: int):
+        self.map[asm_line] = source_line
+
+    def emit(self) -> List[str]:
+        return [f'; line {asm} ← source {src}' for asm, src in self.map.items()]
+
+def emit_line(self, line: str, source_line: int):
+    self.text_lines.append(line)
+    self.source_map.register(len(self.text_lines), source_line)
+
+def encode_dodecagram(ast: Node) -> str:
+    alphabet = '0123456789ab'
+    def encode_node(node):
+        tag = type(node).__name__
+        return alphabet[hash(tag) % len(alphabet)]
+    return ''.join(encode_node(n) for n in ast.traverse())
+
+self.text_lines.append(f'; DODECAGRAM: {encode_dodecagram(ast)}')
+
+def run_debug_session(source: str, platform: str = 'linux'):
+    lexer = Lexer(source)
+    tokens = lexer.tokenize()
+    parser = Parser(tokens)
+    ast = parser.parse()
+
+    tracker = ASTMutationTracker()
+    codegen = CodeGenerator()
+    codegen.tracker = tracker
+    codegen.source_map = SourceMap()
+
+    asm = codegen.generate(ast)
+    asm += '\n'.join(codegen.source_map.emit())
+    asm += f'\n; AST MUTATION TRACE\n{tracker.encode_trace()}'
+    asm += f'\n; DODECAGRAM: {encode_dodecagram(ast)}'
+
+    output = compile_and_run_nasm(asm, platform)
+    print("=== Program Output ===")
+    print(output)
+
